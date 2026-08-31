@@ -1,0 +1,10 @@
+variable "aws_region" { type = string }
+variable "environment" { type = string }
+variable "cluster_name" { type = string }
+variable "vpc_cidr" { type = string }
+variable "system_node_min" { type = number }
+variable "system_node_max" { type = number }
+variable "system_node_desired" { type = number }
+variable "karpenter_version" { type = string }
+variable "karpenter_cpu_limit" { type = string }
+variable "karpenter_memory_limit" { type = string }
