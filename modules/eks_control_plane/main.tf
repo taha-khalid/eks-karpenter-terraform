@@ -20,6 +20,7 @@ module "eks" {
   eks_managed_node_groups = {
     system_nodes = {
       name          = "system-addons"
+      ami_type      = "AL2023_x86_64_STANDARD"
       instance_type = ["t3.medium"]
       min_size      = var.system_node_min
       max_size      = var.system_node_max

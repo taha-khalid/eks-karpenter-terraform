@@ -1,0 +1,3330 @@
+Convert chat to PDF
+Convert chat to PDF
+Open this chat in Acrobat
+Conversation with Gemini
+Give me a project that a senior infra engineer would design that involves eks and karpenter for autoscaling with good security using terraform.
+
+An enterprise-grade architectural blueprint designed to showcase production engineering standards: Zero-Trust EKS with Dynamic Multi-Tenant Karpenter Autoscaling.
+
+Architecture Overview
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │ VPC (Private Subnets Only, VPC Endpoints / NAT Gateway)                │
+ │                                                                        │
+ │   EKS Control Plane (Private API Endpoint)                             │
+ │      │                                                                 │
+ │      ├── Core System Node Group (System-only workloads & Karpenter Pod)│
+ │      │                                                                 │
+ │      └── Karpenter Controller (IRSA / Pod Identity)                     │
+ │             │                                                          │
+ │             ▼ Directly calls AWS EC2 Fleet API                        │
+ │   ┌──────────────────────────────────────────────────────────────┐     │
+ │   │ Karpenter Dynamic Data Plane (Provisioned on-demand)          │     │
+ │   │                                                              │     │
+ │   │   [NodePool: General API]    [NodePool: Batch Processing]    │     │
+ │   │   - x86 Bottlerocket OS      - ARM64 Graviton3 / Spot        │     │
+ │   │   - On-Demand / Nitro        - Consolidation enabled         │     │
+ │   └──────────────────────────────────────────────────────────────┘     │
+ └────────────────────────────────────────────────────────────────────────┘
+Key Architectural Components
+1. VPC & Networking Isolation
+Zero Public Subnet Workloads: EKS Control Plane configured with private-only API endpoint access (accessible via Teleport/VPN).
+
+Subnet Tagging Strategy: Auto-discovery configuration via Terraform tags:
+
+karpenter.sh/discovery = var.cluster_name
+
+kubernetes.io/role/internal-elb = 1
+
+2. Security & Identity Blueprint
+EKS Pod Identity / IRSA: Standard aws-auth ConfigMap is avoided in favor of EKS Pod Identity or strict IRSA. Karpenter runs under a highly restricted IAM role scoped to launching specific EC2 instances with designated tags.
+
+Bottlerocket OS: Provision Karpenter EC2 Node Classes with AWS Bottlerocket instead of Amazon Linux. Bottlerocket features a read-only root filesystem, no shell/package manager, and minimal attack surface.
+
+Node IAM Least-Privilege: Worker nodes provisioned by Karpenter receive standard AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy, and AmazonEC2ContainerRegistryReadOnly—with custom inline policies blocking access to IMDSv1 (http-tokens = required, http-put-response-hop-limit = 1).
+
+3. Multi-NodePool Karpenter Engine
+Instead of relying on rigid Auto Scaling Groups (ASGs), Karpenter is configured via EC2NodeClass and NodePool CRDs split by workload profile:
+
+Critical Control Tier (System): Managed EKS Node Group running kube-system apps (CoreDNS, Metrics Server, Karpenter controller itself) across multi-AZ.
+
+Tier A (Stateless Services): High-availability On-Demand instances, Graviton3 (c7g, m7g), spread across AZs via topology spread constraints.
+
+Tier B (Batch Processing / Async Workers): Aggressive Spot instance fallback (c6i, c7g, m6i) with consolidationPolicy: WhenEmptyOrUnderutilized to minimize idle node spend.
+
+Terraform Project Structure
+Plaintext
+terraform-eks-karpenter/
+├── modules/
+│   ├── vpc/
+│   ├── eks_control_plane/
+│   ├── karpenter_iam/
+│   └── karpenter_resources/     # Applies CRDs via kubectl/helm provider
+├── environments/
+│   └── prod/
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       └── terraform.tfvars
+Core Terraform Code Snippets
+1. Base Cluster & Karpenter IAM Setup (main.tf)
+Uses community-vetted base modules extended with custom security constraints.  
+Terraform Registry
+
+Terraform
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name                    = "prod-infra-cluster"
+  cluster_version                 = "1.30"
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = false # Enforce Zero-Trust Network
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+  # Enable Envelope Encryption for Secrets using KMS
+  create_kms_key = true
+  cluster_encryption_config = {
+    resources = ["secrets"]
+  }
+
+  # Fixed System Node Group for Control System Components & Karpenter
+  eks_managed_node_groups = {
+    karpenter_system = {
+      instance_types = ["m6i.large"]
+      min_size       = 2
+      max_size       = 3
+      desired_size   = 2
+
+      labels = {
+        "workload.type" = "system"
+      }
+      taints = [{
+        key    = "CriticalAddonsOnly"
+        value  = "true"
+        effect = "NO_SCHEDULE"
+      }]
+    }
+  }
+}
+
+# IAM Role for Karpenter Controller via Pod Identity
+module "karpenter" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 20.0"
+
+  cluster_name = module.eks.cluster_name
+
+  enable_pod_identity             = true
+  create_pod_identity_association = true
+
+  # Attach Node IAM Role permissions created by Karpenter
+  node_iam_role_additional_policies = {
+    AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  }
+}
+2. Declarative Karpenter CRDs via Terraform (karpenter_resources.tf)
+Deploying production EC2NodeClass and NodePool directly in HCL via kubectl or helm.  
+OneUptime
+
+Terraform
+# 1. Define AWS Node Specs (Bottlerocket, Security, Network)
+resource "kubectl_manifest" "karpenter_node_class" {
+  yaml_body = <<YAML
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: security-hardened
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: ${module.karpenter.node_iam_role_name}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${module.eks.cluster_name}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${module.eks.cluster_name}
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required  # Enforce IMDSv2
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 20Gi
+        volumeType: gp3
+        encrypted: true
+YAML
+
+  depends_on = [module.eks]
+}
+
+# 2. Define Workload Autoscaling Policy with Consolidation
+resource "kubectl_manifest" "karpenter_nodepool_stateless" {
+  yaml_body = <<YAML
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: stateless-apps
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: security-hardened
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+  limits:
+    cpu: "1000"
+    memory: 2000Gi
+YAML
+
+  depends_on = [kubectl_manifest.karpenter_node_class]
+}
+Advanced Engineering Proof-Points
+Self-Healing Deprovisioning: Configure an SQS event rule triggered by AWS Health Dashboard/EC2 rebalance notifications fed to Karpenter, allowing pre-emptive graceful node draining 2 minutes before Spot termination.  
+Terraform Registry
+
+Kube-Bench / CIS Compliance: Bottlerocket nodes integrated with automated Falco runtime security enforcement deployed via DaemonSets.
+
+Topology Spread Constraints: Application manifests specify Pod Anti-Affinity and topologySpreadConstraints over topology.kubernetes.io/zone, allowing Karpenter to compute multi-AZ instance distribution automatically without manual subnet definitions.
+
+For a complete step-by-step implementation guide, see this AWS EKS with Terraform tutorial, which breaks down deploying the ingress controller, metrics server, and Karpenter for auto-scaling.  
+YouTube
+
+I would further go with Disaster Recovery and Velero and then Datadog and Falco however, first can you give me the whole code for all the parts?
+
+Here is the complete production Terraform code structured into a modular directory layout. It provisions the private network, the private EKS control plane, system node group, Karpenter IAM resources with SQS interruption handling, Helm charts, and custom NodePool manifests.  
+Cast AI
+
+Project Directory Layout
+Plaintext
+terraform-eks-karpenter/
+├── main.tf
+├── outputs.tf
+├── providers.tf
+├── terraform.tfvars
+├── variables.tf
+└── manifests/
+    ├── ec2nodeclass.yaml
+    └── nodepool-stateless.yaml
+providers.tf
+Terraform
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.40"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+  default_tags {
+    tags = {
+      Environment = var.environment
+      ManagedBy   = "Terraform"
+      Project     = "Zero-Trust-EKS-Karpenter"
+    }
+  }
+}
+
+# Dynamic authentication to EKS using cluster credentials
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    }
+  }
+}
+
+provider "kubectl" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
+  load_config_file = false
+}
+variables.tf
+Terraform
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "environment" {
+  type    = string
+  default = "production"
+}
+
+variable "cluster_name" {
+  type    = string
+  default = "prod-eks-karpenter"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.100.0.0/16"
+}
+
+variable "karpenter_version" {
+  type        = string
+  default     = "1.0.0"
+  description = "Karpenter Helm chart version (v1 API)"
+}
+main.tf
+Terraform
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# ------------------------------------------------------------------------------
+# 1. VPC NETWORKING (Private-First Topology)
+# ------------------------------------------------------------------------------
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.5"
+
+  name = "${var.cluster_name}-vpc"
+  cidr = var.vpc_cidr
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
+  private_subnets = [for k, v in slice(data.aws_availability_zones.available.names, 0, 3) : cidrsubnet(var.vpc_cidr, 4, k)]
+  public_subnets  = [for k, v in slice(data.aws_availability_zones.available.names, 0, 3) : cidrsubnet(var.vpc_cidr, 8, k + 48)]
+
+  enable_nat_gateway   = true
+  single_nat_gateway   = false # Highly available across AZs
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  # Karpenter & ALB Auto-Discovery Subnet Tags
+  private_subnet_tags = {
+    "karpenter.sh/discovery"                  = var.cluster_name
+    "kubernetes.io/role/internal-elb"         = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 2. EKS CONTROL PLANE & SYSTEM NODE GROUP
+# ------------------------------------------------------------------------------
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name                   = var.cluster_name
+  cluster_version                = "1.30"
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = false # Enforce Zero-Trust Network access
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+  # KMS Envelope Encryption for Secrets
+  create_kms_key = true
+  cluster_encryption_config = {
+    resources = ["secrets"]
+  }
+
+  # Enable Pod Identity authentication engine
+  enable_cluster_creator_admin_permissions = true
+
+  # Dedicated System Node Group for System Pods and Karpenter Controller
+  eks_managed_node_groups = {
+    system_nodes = {
+      name           = "system-addons"
+      instance_types = ["m6i.large"]
+      min_size       = 2
+      max_size       = 3
+      desired_size   = 2
+
+      subnet_ids = module.vpc.private_subnets
+
+      labels = {
+        "workload.type" = "system"
+      }
+
+      taints = [{
+        key    = "CriticalAddonsOnly"
+        value  = "true"
+        effect = "NO_SCHEDULE"
+      }]
+
+      # Security Hardening: Enforce IMDSv2 on System Nodes
+      metadata_options = {
+        http_endpoint               = "enabled"
+        http_tokens                 = "required"
+        http_put_response_hop_limit = 1
+      }
+    }
+  }
+
+  # Cluster Security Group Discovery Tagging for Karpenter
+  node_security_group_tags = {
+    "karpenter.sh/discovery" = var.cluster_name
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 3. KARPENTER IAM & SQS INTERRUPTION INFRASTRUCTURE
+# ------------------------------------------------------------------------------
+module "karpenter" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 20.0"
+
+  cluster_name = module.eks.cluster_name
+
+  # Enable native EKS Pod Identity Association
+  enable_pod_identity             = true
+  create_pod_identity_association = true
+
+  # Attach standard SSM Policy to nodes launched by Karpenter for management
+  node_iam_role_additional_policies = {
+    AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  }
+
+  # Automatically provisions SQS queue & EventBridge rules for Spot Interruption notifications
+  enable_spot_termination = true
+}
+
+# ------------------------------------------------------------------------------
+# 4. HELM DEPLOYMENTS (Karpenter & System Workloads)
+# ------------------------------------------------------------------------------
+
+# Helm Release for Karpenter Controller
+resource "helm_release" "karpenter" {
+  namespace        = "kube-system"
+  name             = "karpenter"
+  repository       = "oci://public.ecr.aws/karpenter"
+  chart            = "karpenter"
+  version          = var.karpenter_version
+  create_namespace = false
+
+  values = [
+    <<YAML
+settings:
+  clusterName: ${module.eks.cluster_name}
+  clusterEndpoint: ${module.eks.cluster_endpoint}
+  interruptionQueue: ${module.karpenter.queue_name}
+tolerations:
+  - key: "CriticalAddonsOnly"
+    operator: "Exists"
+    effect: "NoSchedule"
+nodeSelector:
+  workload.type: "system"
+YAML
+  ]
+
+  depends_on = [module.eks, module.karpenter]
+}
+
+# ------------------------------------------------------------------------------
+# 5. KARPENTER CRD MANIFEST APPLIES (v1 API Standard)
+# ------------------------------------------------------------------------------
+resource "kubectl_manifest" "karpenter_ec2_node_class" {
+  yaml_body = templatefile("${path.module}/manifests/ec2nodeclass.yaml", {
+    cluster_name   = module.eks.cluster_name
+    node_role_name = module.karpenter.node_iam_role_name
+  })
+
+  depends_on = [helm_release.karpenter]
+}
+
+resource "kubectl_manifest" "karpenter_node_pool" {
+  yaml_body = file("${path.module}/manifests/nodepool-stateless.yaml")
+
+  depends_on = [kubectl_manifest.karpenter_ec2_node_class]
+}
+Manifest Files
+manifests/ec2nodeclass.yaml
+YAML
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: security-hardened
+spec:
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: ${node_role_name}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required  # Enforces IMDSv2
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 20Gi
+        volumeType: gp3
+        encrypted: true
+manifests/nodepool-stateless.yaml
+YAML
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: stateless-apps
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: security-hardened
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+    budgets:
+      - nodes: "10%" # Max 10% of nodes disrupted simultaneously
+  limits:
+    cpu: "1000"
+    memory: 2000Gi
+outputs.tf
+Terraform
+output "cluster_name" {
+  description = "EKS Cluster Name"
+  value       = module.eks.cluster_name
+}
+
+output "cluster_endpoint" {
+  description = "Private API Endpoint for EKS"
+  value       = module.eks.cluster_endpoint
+}
+
+output "karpenter_node_role_arn" {
+  description = "IAM Role ARN assigned to dynamic EC2 nodes"
+  value       = module.karpenter.node_iam_role_arn
+}
+
+output "karpenter_sqs_queue_url" {
+  description = "SQS Interruption Queue URL used by Karpenter"
+  value       = module.karpenter.queue_url
+}
+terraform.tfvars
+Terraform
+aws_region        = "us-east-1"
+environment       = "production"
+cluster_name      = "prod-eks-karpenter"
+vpc_cidr          = "10.100.0.0/16"
+karpenter_version = "1.0.0"
+terraform-eks-karpenter/
+
+├── modules/
+
+│   ├── vpc/
+
+│   ├── eks_control_plane/
+
+│   ├── karpenter_iam/
+
+│   └── karpenter_resources/     # Applies CRDs via kubectl/helm provider
+
+├── environments/
+
+│   └── prod/
+
+│       ├── main.tf
+
+│       ├── variables.tf
+
+│       ├── outputs.tf
+
+│       └── terraform.tfvars
+
+
+
+I want this in this structure since I also have dev and staging added in the environments as well .
+
+Here is the complete production-grade codebase refactored into the modular structure with explicit support for multi-environment deployments (dev, staging, prod).
+
+Project Structure
+Plaintext
+terraform-eks-karpenter/
+├── modules/
+│   ├── vpc/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── eks_control_plane/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── karpenter_iam/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── karpenter_resources/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── manifests/
+│           ├── ec2nodeclass.yaml
+│           └── nodepool-stateless.yaml
+└── environments/
+    ├── dev/
+    │   ├── main.tf
+    │   ├── providers.tf
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   └── terraform.tfvars
+    ├── staging/
+    │   └── ... (mirrors dev/prod)
+    └── prod/
+        ├── main.tf
+        ├── providers.tf
+        ├── variables.tf
+        ├── outputs.tf
+        └── terraform.tfvars
+Part 1: Reusable Modules (/modules)
+1. VPC Module (modules/vpc)
+modules/vpc/variables.tf
+
+Terraform
+variable "cluster_name" { type = string }
+variable "vpc_cidr" { type = string }
+variable "environment" { type = string }
+modules/vpc/main.tf
+
+Terraform
+data "aws_availability_zones" "available" { state = "available" }
+
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.5"
+
+  name = "${var.cluster_name}-vpc"
+  cidr = var.vpc_cidr
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 3)
+  private_subnets = [for k, v in slice(data.aws_availability_zones.available.names, 0, 3) : cidrsubnet(var.vpc_cidr, 4, k)]
+  public_subnets  = [for k, v in slice(data.aws_availability_zones.available.names, 0, 3) : cidrsubnet(var.vpc_cidr, 8, k + 48)]
+
+  enable_nat_gateway   = true
+  single_nat_gateway   = var.environment == "prod" ? false : true # Cost save for Dev/Staging
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  private_subnet_tags = {
+    "karpenter.sh/discovery"                    = var.cluster_name
+    "kubernetes.io/role/internal-elb"           = "1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+  }
+}
+modules/vpc/outputs.tf
+
+Terraform
+output "vpc_id" { value = module.vpc.vpc_id }
+output "private_subnets" { value = module.vpc.private_subnets }
+2. EKS Control Plane Module (modules/eks_control_plane)
+modules/eks_control_plane/variables.tf
+
+Terraform
+variable "cluster_name" { type = string }
+variable "vpc_id" { type = string }
+variable "subnet_ids" { type = list(string) }
+variable "system_node_min" { type = number }
+variable "system_node_max" { type = number }
+variable "system_node_desired" { type = number }
+modules/eks_control_plane/main.tf
+
+Terraform
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name                    = var.cluster_name
+  cluster_version                 = "1.30"
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = false # Zero-Trust Policy
+
+  vpc_id     = var.vpc_id
+  subnet_ids = var.subnet_ids
+
+  create_kms_key = true
+  cluster_encryption_config = {
+    resources = ["secrets"]
+  }
+
+  enable_cluster_creator_admin_permissions = true
+
+  eks_managed_node_groups = {
+    system_nodes = {
+      name           = "system-addons"
+      instance_types = ["m6i.large"]
+      min_size       = var.system_node_min
+      max_size       = var.system_node_max
+      desired_size   = var.system_node_desired
+
+      subnet_ids = var.subnet_ids
+
+      labels = { "workload.type" = "system" }
+      taints = [{
+        key    = "CriticalAddonsOnly"
+        value  = "true"
+        effect = "NO_SCHEDULE"
+      }]
+
+      metadata_options = {
+        http_endpoint               = "enabled"
+        http_tokens                 = "required"
+        http_put_response_hop_limit = 1
+      }
+    }
+  }
+
+  node_security_group_tags = {
+    "karpenter.sh/discovery" = var.cluster_name
+  }
+}
+modules/eks_control_plane/outputs.tf
+
+Terraform
+output "cluster_name" { value = module.eks.cluster_name }
+output "cluster_endpoint" { value = module.eks.cluster_endpoint }
+output "cluster_certificate_authority_data" { value = module.eks.cluster_certificate_authority_data }
+3. Karpenter IAM Module (modules/karpenter_iam)
+modules/karpenter_iam/variables.tf
+
+Terraform
+variable "cluster_name" { type = string }
+modules/karpenter_iam/main.tf
+
+Terraform
+module "karpenter_iam" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 20.0"
+
+  cluster_name                    = var.cluster_name
+  enable_pod_identity             = true
+  create_pod_identity_association = true
+
+  node_iam_role_additional_policies = {
+    AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  }
+
+  enable_spot_termination = true
+}
+modules/karpenter_iam/outputs.tf
+
+Terraform
+output "node_iam_role_name" { value = module.karpenter_iam.node_iam_role_name }
+output "node_iam_role_arn" { value = module.karpenter_iam.node_iam_role_arn }
+output "queue_name" { value = module.karpenter_iam.queue_name }
+4. Karpenter Resources & Manifests Module (modules/karpenter_resources)
+modules/karpenter_resources/variables.tf
+
+Terraform
+variable "cluster_name" { type = string }
+variable "cluster_endpoint" { type = string }
+variable "node_role_name" { type = string }
+variable "interruption_queue_name" { type = string }
+variable "karpenter_version" { type = string }
+variable "cpu_limit" { type = string }
+variable "memory_limit" { type = string }
+modules/karpenter_resources/main.tf
+
+Terraform
+resource "helm_release" "karpenter" {
+  namespace        = "kube-system"
+  name             = "karpenter"
+  repository       = "oci://public.ecr.aws/karpenter"
+  chart            = "karpenter"
+  version          = var.karpenter_version
+  create_namespace = false
+
+  values = [
+    <<YAML
+settings:
+  clusterName: ${var.cluster_name}
+  clusterEndpoint: ${var.cluster_endpoint}
+  interruptionQueue: ${var.interruption_queue_name}
+tolerations:
+  - key: "CriticalAddonsOnly"
+    operator: "Exists"
+    effect: "NoSchedule"
+nodeSelector:
+  workload.type: "system"
+YAML
+  ]
+}
+
+resource "kubectl_manifest" "ec2_node_class" {
+  yaml_body = templatefile("${path.module}/manifests/ec2nodeclass.yaml", {
+    cluster_name   = var.cluster_name
+    node_role_name = var.node_role_name
+  })
+
+  depends_on = [helm_release.karpenter]
+}
+
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", {
+    cpu_limit    = var.cpu_limit
+    memory_limit = var.memory_limit
+  })
+
+  depends_on = [kubectl_manifest.ec2_node_class]
+}
+modules/karpenter_resources/manifests/ec2nodeclass.yaml
+
+YAML
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: security-hardened
+spec:
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  role: ${node_role_name}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 20Gi
+        volumeType: gp3
+        encrypted: true
+modules/karpenter_resources/manifests/nodepool-stateless.yaml
+
+YAML
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: stateless-apps
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: security-hardened
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+    budgets:
+      - nodes: "10%"
+  limits:
+    cpu: "${cpu_limit}"
+    memory: "${memory_limit}"
+Part 2: Environment Layer (/environments/prod)
+environments/prod/providers.tf
+Terraform
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws     = { source = "hashicorp/aws", version = "~> 5.40" }
+    helm    = { source = "hashicorp/helm", version = "~> 2.12" }
+    kubectl = { source = "gavinbunney/kubectl", version = "~> 1.14" }
+  }
+
+  # Recommended S3 State Backend strategy
+  # backend "s3" {
+  #   bucket         = "company-tf-state-prod"
+  #   key            = "eks-karpenter/terraform.tfstate"
+  #   region         = "us-east-1"
+  #   dynamodb_table = "terraform-locks"
+  # }
+}
+
+provider "aws" {
+  region = var.aws_region
+  default_tags {
+    tags = {
+      Environment = var.environment
+      ManagedBy   = "Terraform"
+    }
+  }
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    }
+  }
+}
+
+provider "kubectl" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+  }
+  load_config_file = false
+}
+environments/prod/main.tf
+Terraform
+module "vpc" {
+  source = "../../modules/vpc"
+
+  cluster_name = var.cluster_name
+  vpc_cidr     = var.vpc_cidr
+  environment  = var.environment
+}
+
+module "eks" {
+  source = "../../modules/eks_control_plane"
+
+  cluster_name         = var.cluster_name
+  vpc_id               = module.vpc.vpc_id
+  subnet_ids           = module.vpc.private_subnets
+  system_node_min      = var.system_node_min
+  system_node_max      = var.system_node_max
+  system_node_desired  = var.system_node_desired
+}
+
+module "karpenter_iam" {
+  source = "../../modules/karpenter_iam"
+
+  cluster_name = module.eks.cluster_name
+}
+
+module "karpenter_resources" {
+  source = "../../modules/karpenter_resources"
+
+  cluster_name            = module.eks.cluster_name
+  cluster_endpoint        = module.eks.cluster_endpoint
+  node_role_name          = module.karpenter_iam.node_iam_role_name
+  interruption_queue_name = module.karpenter_iam.queue_name
+  karpenter_version       = var.karpenter_version
+  cpu_limit               = var.karpenter_cpu_limit
+  memory_limit            = var.karpenter_memory_limit
+
+  depends_on = [module.eks, module.karpenter_iam]
+}
+environments/prod/variables.tf
+Terraform
+variable "aws_region" { type = string }
+variable "environment" { type = string }
+variable "cluster_name" { type = string }
+variable "vpc_cidr" { type = string }
+variable "system_node_min" { type = number }
+variable "system_node_max" { type = number }
+variable "system_node_desired" { type = number }
+variable "karpenter_version" { type = string }
+variable "karpenter_cpu_limit" { type = string }
+variable "karpenter_memory_limit" { type = string }
+environments/prod/terraform.tfvars
+Terraform
+aws_region             = "us-east-1"
+environment            = "production"
+cluster_name           = "prod-eks-karpenter"
+vpc_cidr               = "10.100.0.0/16"
+system_node_min        = 2
+system_node_max        = 5
+system_node_desired    = 3
+karpenter_version      = "1.0.0"
+karpenter_cpu_limit    = "2000"
+karpenter_memory_limit = "4000Gi"
+environments/dev/terraform.tfvars (Example to highlight differences)
+Terraform
+aws_region             = "us-east-1"
+environment            = "development"
+cluster_name           = "dev-eks-karpenter"
+vpc_cidr               = "10.200.0.0/16"
+system_node_min        = 1
+system_node_max        = 2
+system_node_desired    = 1
+karpenter_version      = "1.0.0"
+karpenter_cpu_limit    = "200"
+karpenter_memory_limit = "400Gi"
+environments/prod/outputs.tf
+Terraform
+output "cluster_name" { value = module.eks.cluster_name }
+output "cluster_endpoint" { value = module.eks.cluster_endpoint }
+output "karpenter_node_role_arn" { value = module.karpenter_iam.node_iam_role_arn }
+Okay, I have done this now I only need to run init and apply with terraform, right?
+
+Before running terraform apply, running a single full apply against a newly created EKS cluster with Helm and Kubernetes resources can lead to authentication or API discovery issues during the plan phase.
+
+Execute these deployment steps to avoid provider timing issues:
+
+Execution Workflow
+Step 1: Initialize and Select Environment
+Navigate to the target environment directory and initialize provider plugins.
+
+Bash
+cd environments/prod
+terraform init
+Step 2: Target Base Infrastructure First (Crucial)
+The helm and kubectl providers need an active EKS API endpoint to plan correctly. Provision the VPC and EKS cluster before applying Kubernetes resources:
+
+Bash
+# Provision VPC, EKS Control Plane, and Karpenter IAM roles first
+terraform apply -target=module.vpc -target=module.eks -target=module.karpenter_iam
+Step 3: Update Local kubeconfig
+Once the control plane is live, configure local credentials so Terraform (and your local machine) can authenticate to the EKS cluster:
+
+Bash
+aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
+Step 4: Apply Remaining Resources (Karpenter Helm & CRDs)
+Apply the rest of the stack. This will deploy the Karpenter Helm chart, the EC2NodeClass, and the NodePool manifests:
+
+Bash
+terraform apply
+Step 5: Verify Karpenter Provisioning
+Confirm that the Karpenter controller is running and inspecting NodePools:
+
+Bash
+# Check Karpenter Controller Pod status
+kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter
+
+# Check CRD installation
+kubectl get ec2nodeclasses.karpenter.k8s.aws
+kubectl get nodepools.karpenter.sh
+ Error: Invalid registry module source address
+
+│ 
+
+│   on ../../modules/karpenter_iam/main.tf line 2, in module "karpenter_iam":
+
+│    2:   source  = "terraform-aws-modules/eks/aws/modules/karpenter"
+
+
+
+Getting this error.
+
+This error happens because Terraform requires a double slash (//) to reference submodules inside a public Terraform Registry repository.
+
+Without the //, Terraform tries to look for a root registry module named aws/modules/karpenter, which does not exist.  
+Stack Overflow
+
+The Fix
+Open modules/karpenter_iam/main.tf and change line 2 from a single slash to a double slash (//):
+
+❌ Before
+Terraform
+module "karpenter_iam" {
+  source  = "terraform-aws-modules/eks/aws/modules/karpenter"
+  version = "~> 20.0"
+  ...
+}
+✅ After
+Terraform
+module "karpenter_iam" {
+  source  = "terraform-aws-modules/eks/aws//modules/karpenter"
+  version = "~> 20.0"
+  ...
+}
+Next Steps
+Once updated, re-initialize Terraform to pull in the submodule correctly:
+
+Bash
+cd environments/prod
+terraform init
+Initializing modules...
+
+Downloading registry.terraform.io/terraform-aws-modules/eks/aws 20.37.2 for karpenter_iam.karpenter_iam...
+
+- karpenter_iam.karpenter_iam in .terraform/modules/karpenter_iam.karpenter_iam/modules/karpenter
+
+╷
+
+│ Error: Function calls not allowed
+
+│ 
+
+│   on providers.tf line 12, in terraform:
+
+│   12:     key          = "${path_relative_to_include()}/terraform.tfstate"
+
+│ 
+
+│ Functions may not be called here.
+
+
+
+What about this?
+
+This error occurs because path_relative_to_include() is a Terragrunt function, not a standard Terraform function.  
+davidbegin.github.io
+
+Native Terraform does not allow function calls inside the backend block (or terraform settings block). Native HCL requires hardcoded string literals for the backend key.
+
+The Fix
+Replace the dynamic function call in environments/prod/providers.tf with a static string path:
+
+❌ Before (providers.tf)
+Terraform
+terraform {
+  backend "s3" {
+    bucket = "company-tf-state-prod"
+    key    = "${path_relative_to_include()}/terraform.tfstate" # ❌ Invalid standard Terraform
+    region = "us-east-1"
+  }
+}
+✅ After (environments/prod/providers.tf)
+Terraform
+terraform {
+  backend "s3" {
+    bucket         = "company-tf-state-prod"
+    key            = "environments/prod/terraform.tfstate" # ✅ Hardcoded string
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+  }
+}
+How to handle other environments
+Assign a unique hardcoded key for each environment state:
+
+Dev (environments/dev/providers.tf):
+key = "environments/dev/terraform.tfstate"
+
+Staging (environments/staging/providers.tf):
+key = "environments/staging/terraform.tfstate"
+
+Prod (environments/prod/providers.tf):
+key = "environments/prod/terraform.tfstate"
+
+(Note: If you do not have an S3 bucket configured yet, comment out the backend "s3" block entirely to use a local terraform.tfstate file while testing).
+
+Error: Failed to query available provider packages
+
+│ 
+
+│ Could not retrieve the list of available versions for provider hashicorp/kubelet: provider registry registry.terraform.io does not have a provider named
+
+│ registry.terraform.io/hashicorp/kubelet
+
+│ 
+
+│ All modules should specify their required_providers so that external consumers will get the correct providers when using a module. To see which modules are
+
+│ currently depending on hashicorp/kubelet, run the following command:
+
+│     terraform providers
+
+This error happens because one of your modules or submodules is implicitly using a resource named kubelet (or declaring a provider without specifying its full registry namespace). When no provider source is declared for a provider name, Terraform defaults to looking under hashicorp/<provider_name> on the public registry. Since hashicorp/kubelet doesn't exist, terraform init fails.
+
+Step 1: Find Which File is Triggering kubelet
+Run the following command inside your environment directory (environments/prod):
+
+Bash
+terraform providers
+Look at the dependency tree output to see which module lists provider[registry.terraform.io/hashicorp/kubelet].
+
+Alternatively, search your HCL files for any typo or reference to kubelet:
+
+Bash
+grep -rn "kubelet" modules/ environments/
+Common causes:
+
+A typo in a resource name (e.g., writing resource "kubelet_..." instead of resource "kubectl_...").
+
+A typo in required_providers (e.g., writing kubelet = { source = ... } instead of kubectl = { source = "gavinbunney/kubectl" }).
+
+Step 2: Ensure required_providers is Declared in Submodules
+If you are using the kubectl provider inside modules/karpenter_resources, that module must explicit declare kubectl inside its own required_providers block. Otherwise, Terraform might misinterpret provider requirements passed down from child modules.
+
+Open modules/karpenter_resources/main.tf (or create a versions.tf in that module folder) and add:
+
+Terraform
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
+    }
+  }
+}
+Step 3: Re-initialize Terraform
+After correcting the source path or fixing the typo, clean any cached plugins and re-run initialization:
+
+Bash
+# Clear provider cache state
+rm -rf .terraform .terraform.lock.hcl
+
+# Re-initialize
+terraform init
+Created a new versions.tf in the karpenter_resources folder as well and added your code still getting this.
+
+Partner and community providers are signed by their developers.
+
+If you'd like to know more about provider signing, you can read about it here:
+
+https://developer.hashicorp.com/terraform/cli/plugins/signing
+
+╷
+
+│ Error: Failed to query available provider packages
+
+│ 
+
+│ Could not retrieve the list of available versions for provider hashicorp/kubelet: provider
+
+│ registry registry.terraform.io does not have a provider named
+
+│ registry.terraform.io/hashicorp/kubelet
+
+│ 
+
+│ All modules should specify their required_providers so that external consumers will get the
+
+│ correct providers when using a module. To see which modules are currently depending on
+
+│ hashicorp/kubelet, run the following command:
+
+│     terraform providers
+
+The error registry.terraform.io/hashicorp/kubelet means Terraform detected a resource type in your HCL files starting with kubelet_ (e.g., resource "kubelet_manifest" ...).
+
+Because kubelet is not a valid Terraform provider, Terraform thinks you want a provider named kubelet from HashiCorp and fails when searching the registry. The actual provider is kubectl (ending in ctl).
+
+Step 1: Locate and Fix the Typo
+Run this search command from your root directory (terraform-eks-karpenter/) to find every occurrence of the word kubelet:
+
+Bash
+grep -rn "kubelet" modules/ environments/
+Look closely at modules/karpenter_resources/main.tf. You likely have:
+
+❌ Incorrect Code
+Terraform
+resource "kubelet_manifest" "ec2_node_class" {   # ❌ "kubelet_" is wrong!
+  yaml_body = ...
+}
+
+resource "kubelet_manifest" "node_pool" {        # ❌ "kubelet_" is wrong!
+  yaml_body = ...
+}
+✅ Corrected Code (modules/karpenter_resources/main.tf)
+Change kubelet_manifest to kubectl_manifest (with a c):
+
+Terraform
+resource "kubectl_manifest" "ec2_node_class" {   # ✅ Correct: "kubectl_manifest"
+  yaml_body = templatefile("${path.module}/manifests/ec2nodeclass.yaml", {
+    cluster_name   = var.cluster_name
+    node_role_name = var.node_role_name
+  })
+
+  depends_on = [helm_release.karpenter]
+}
+
+resource "kubectl_manifest" "node_pool" {        # ✅ Correct: "kubectl_manifest"
+  yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", {
+    cpu_limit    = var.cpu_limit
+    memory_limit = var.memory_limit
+  })
+
+  depends_on = [kubectl_manifest.ec2_node_class]
+}
+Step 2: Clean and Re-initialize
+After fixing the typo, purge the corrupted local provider cache in your environment directory:
+
+Bash
+cd environments/prod
+
+# Remove cached lock file and downloaded metadata
+rm -rf .terraform .terraform.lock.hcl
+
+# Re-initialize provider plugins
+terraform init
+Should I add terraform.lock.hcl in the gitignore?
+
+No, do NOT add .terraform.lock.hcl to your .gitignore.  
+OneUptime
+
+The lock file is equivalent to package-lock.json in Node.js or Gemfile.lock in Ruby. It ensures deterministic builds across your team and CI/CD pipelines.  
+OneUptime
+
+Why you should commit .terraform.lock.hcl
+Prevents Drift: Without it, running terraform init on a colleague's laptop or in a GitHub Actions pipeline might download a newer, untested provider patch version (e.g., hashicorp/aws upgrading from v5.40.0 to v5.41.0) that introduces breaking changes.  
+Rishab Kumar
+
+Explicit Upgrades: Sticking the lock file in version control forces provider upgrades to be explicit code changes via terraform init -upgrade, which team members can review in PRs.  
+OneUptime
+
+Recommended .gitignore for Terraform
+Only exclude local runtime caches, state files, and secrets:
+
+Code snippet
+# Exclude local state files (Use S3/DynamoDB backends instead)
+*.tfstate
+*.tfstate.backup
+*.tfstate.lock.info
+
+# Exclude local provider binaries and module downloads
+.terraform/
+
+# Exclude local CLI configuration and plan outputs
+*.tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Exclude secrets/variable overrides
+*.tfvars
+*.tfvars.json
+
+# DO NOT include .terraform.lock.hcl here!
+Pro-Tip: Multi-Platform Lock Files
+If your team works across different OS platforms (e.g., macOS M-series chips and Linux CI pipelines), populating hashes for all target platforms avoids OS-specific checksum errors:
+
+Bash
+terraform providers lock \
+  -platform=linux_amd64 \
+  -platform=darwin_arm64 \
+  -platform=darwin_amd64
+Commit the updated .terraform.lock.hcl along with your .tf files.
+
+How to check syntax with terraform command?
+
+To check syntax and internal consistency in Terraform, run the built-in validation commands in your working directory.
+
+1. terraform validate (Primary Syntax Check)
+This command parses all .tf files in the current directory and checks for syntax errors, missing required arguments, invalid attribute names, and type mismatches.  
+HashiCorp Developer
+
+Bash
+terraform validate
+Note: terraform validate requires local provider schemas to evaluate your code. If you haven't initialized the directory yet, run terraform init first. If you want to initialize without accessing remote cloud backends, use:
+
+Bash
+terraform init -backend=false
+terraform validate
+2. terraform fmt -check (Formatting & Structural Check)
+While validate checks semantic correctness, fmt -check verifies if your HCL files conform to standard Terraform formatting rules without making changes:
+
+Bash
+terraform fmt -check
+If files need formatting, it returns exit code 3 and lists the unformatted files.
+
+To automatically format them, run terraform fmt.
+
+3. Machine-Readable Output (CI/CD Pipelines)
+If you are integrating syntax checks into a pre-commit hook or GitHub Actions pipeline, pass the -json flag for automated parsing:
+
+Bash
+terraform validate -json
+
+
+│ Error: Invalid function argument
+
+│ 
+
+│   on ../../modules/karpenter_resources/main.tf line 26, in resource "kubectl_manifest" "ec2_node_class":
+
+│   26:   yaml_body = templatefile("{path.module}/manifests/ec2nodeclass.yaml", {
+
+│   27:     cluster_name   = var.cluster_name
+
+│   28:     node_role_name = var.node_role_name
+
+│   29:   })
+
+│     ├────────────────
+
+│     │ while calling templatefile(path, vars)
+
+│ 
+
+│ Invalid value for "path" parameter: no file exists at "{path.module}/manifests/ec2nodeclass.yaml"; this function works only with files that are distributed as
+
+│ part of the configuration source code, so if this file will be created by a resource in this configuration you must instead obtain this result from an
+
+│ attribute of that resource.
+
+╵
+
+
+
+Getting this on terraform validate.
+
+This error occurs because of a missing dollar sign ($) before {path.module} in modules/karpenter_resources/main.tf.
+
+Without $, Terraform interprets {path.module} as a literal string folder named "{path.module}" instead of evaluating the variable path.
+
+The Fix
+Open modules/karpenter_resources/main.tf and update both kubectl_manifest resources to include the missing $ character.
+
+❌ Before
+Terraform
+resource "kubectl_manifest" "ec2_node_class" {
+  yaml_body = templatefile("{path.module}/manifests/ec2nodeclass.yaml", { # ❌ Missing $
+    cluster_name   = var.cluster_name
+    node_role_name = var.node_role_name
+  })
+
+  depends_on = [helm_release.karpenter]
+}
+✅ After
+Terraform
+resource "kubectl_manifest" "ec2_node_class" {
+  yaml_body = templatefile("${path.module}/manifests/ec2nodeclass.yaml", { # ✅ Fixed: ${path.module}
+    cluster_name   = var.cluster_name
+    node_role_name = var.node_role_name
+  })
+
+  depends_on = [helm_release.karpenter]
+}
+Make sure your node_pool manifest resource right below it also uses ${path.module}:
+
+Terraform
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", { # ✅ Fixed: ${path.module}
+    cpu_limit    = var.cpu_limit
+    memory_limit = var.memory_limit
+  })
+
+  depends_on = [kubectl_manifest.ec2_node_class]
+}
+Verify the Fix
+Re-run validation in your environment directory:
+
+Bash
+terraform validate
+ Error: Invalid function argument
+
+│ 
+
+│   on ../../modules/karpenter_resources/main.tf line 36, in resource "kubectl_manifest" "node_pool":
+
+│   36:   yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", {
+
+│   37:     cpu_limit    = var.cpu_limit
+
+│   38:     memory_limit = var.memory_limit
+
+│   39:   })
+
+│     ├────────────────
+
+│     │ while calling templatefile(path, vars)
+
+│     │ path.module is "../../modules/karpenter_resources"
+
+│ 
+
+│ Invalid value for "path" parameter: no file exists at "../../modules/karpenter_resources/manifests/nodepool-stateless.yaml"; this function works only with
+
+│ files that are distributed as part of the configuration source code, so if this file will be created by a resource in this configuration you must instead
+
+│ obtain this result from an attribute of that resource.
+
+╵
+
+
+
+Still the same error.
+
+This error means Terraform cannot locate the file nodepool-stateless.yaml at that relative directory path.
+
+This usually happens if the file is named slightly differently, located in the wrong directory, or if the manifests/ folder sits under modules/karpenter_resources instead of inside it.
+
+Step 1: Verify the File Location
+Run this command from your root directory (terraform-eks-karpenter/):
+
+Bash
+ls -la modules/karpenter_resources/manifests/
+Check for:
+
+File extension mismatch: Is it .yml instead of .yaml?
+
+Missing file: Did nodepool-stateless.yaml accidentally end up directly under modules/karpenter_resources/ instead of modules/karpenter_resources/manifests/?
+
+Step 2: Correct Directory Placement
+The manifest files must sit inside the child module's directory structure:
+
+Plaintext
+modules/
+└── karpenter_resources/
+    ├── main.tf
+    ├── variables.tf
+    └── manifests/                   <-- manifests subfolder inside module
+        ├── ec2nodeclass.yaml
+        └── nodepool-stateless.yaml  <-- file referenced by templatefile
+If the manifests folder is currently located outside modules/karpenter_resources/, move it in:
+
+Bash
+# Move manifests inside the module if they were accidentally placed at root
+mv manifests/ modules/karpenter_resources/
+Step 3: Alternative Path Fix (If Files are Managed Outside Module)
+If you prefer keeping your manifest files at the project root or environment level rather than inside modules/karpenter_resources/manifests/, pass the file path as a variable instead of hardcoding path.module.
+
+Option A: Keeping files inside the module (Standard)
+Ensure file exists at: modules/karpenter_resources/manifests/nodepool-stateless.yaml
+
+Option B: Passing the file contents dynamically via variables
+In modules/karpenter_resources/variables.tf:
+
+Terraform
+variable "node_pool_manifest_path" {
+  type        = string
+  default     = ""
+  description = "Optional path override for NodePool template"
+}
+Then in modules/karpenter_resources/main.tf:
+
+Terraform
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile(
+    var.node_pool_manifest_path != "" ? var.node_pool_manifest_path : "${path.module}/manifests/nodepool-stateless.yaml",
+    {
+      cpu_limit    = var.cpu_limit
+      memory_limit = var.memory_limit
+    }
+  )
+
+  depends_on = [kubectl_manifest.ec2_node_class]
+}
+Verify the Fix
+Once the file is confirmed at modules/karpenter_resources/manifests/nodepool-stateless.yaml, re-run validation from environments/prod/:
+
+Bash
+terraform validate
+ls -la modules/karpenter_resources/manifests/
+
+total 16
+
+drwxr-xr-x 2 taha taha 4096 Aug 26 17:17 .
+
+drwxr-xr-x 3 taha taha 4096 Aug 30 16:49 ..
+
+-rw-r--r-- 1 taha taha  638 Aug 26 17:53 ec2nodeclass.yaml
+
+-rw-r--r-- 1 taha taha  837 Aug 30 16:18 nodepool_stateless.yaml
+
+The file on your disk is named with an underscore: nodepool_stateless.yaml, but your Terraform code is looking for a hyphenated filename: nodepool-stateless.yaml.
+
+Option 1: Rename the File (Recommended)
+Rename the file on your disk to use a hyphen so it matches standard Kubernetes naming conventions and your Terraform configuration:
+
+Bash
+mv modules/karpenter_resources/manifests/nodepool_stateless.yaml modules/karpenter_resources/manifests/nodepool-stateless.yaml
+Option 2: Update main.tf
+Alternatively, update line 36 in modules/karpenter_resources/main.tf to use the underscore filename:
+
+❌ Before
+Terraform
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", {
+✅ After
+Terraform
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile("${path.module}/manifests/nodepool_stateless.yaml", {
+Verify Validation
+After applying either fix, run validation from your environment directory:
+
+Bash
+cd environments/prod
+terraform validate
+How many nodes would be launched by this cluster when it starts?
+
+
+
+And what would be the size of the nodes?
+
+When the cluster starts, it will launch 2 nodes initially.
+
+Initial Node Count
+System Node Group (Managed EKS): 2 nodes (desired_size = 2 in prod/terraform.tfvars).
+
+Karpenter Data Plane: 0 nodes at startup. Karpenter is an event-driven autoscaler that provisions zero worker nodes by default. It only launches EC2 instances when pending pods (workloads) request resources that the system nodes cannot satisfy.
+
+Node Specifications & Instance Sizes
+1. Fixed System Nodes (Managed Node Group)
+These host CoreDNS, Metrics Server, and the Karpenter controller pod itself.
+
+Instance Type: m6i.large (2 vCPUs, 8 GiB RAM).
+
+Disk Size: 20 GiB gp3 (default EKS managed node volume size).
+
+OS: Standard Amazon Linux 2 / EKS Optimized AMI.
+
+2. Karpenter Dynamic Nodes (When Workloads Scale Up)
+When your application pods start requesting resources, Karpenter dynamically provisions instances matching the criteria set in nodepool-stateless.yaml and ec2nodeclass.yaml:
+
+Instance Families: Any instance from the C (Compute), M (General Purpose), or R (Memory) families (e.g., c6i.xlarge, m7g.large, r6i.2xlarge).
+
+Architectures: Automatically chooses between x86 (amd64) or ARM64 (arm64 Graviton) depending on pod architecture constraints and lowest cost.
+
+Capacity Type: Mix of Spot and On-Demand (Karpenter picks the cheapest available instance type across available Availability Zones).
+
+Disk Size & OS: 20 GiB encrypted gp3 volumes running security-hardened Bottlerocket OS.
+
+The karpenter_resources doesn't have output.tf?
+
+That's correct—in the current setup, modules/karpenter_resources doesn't strictly require an outputs.tf because it sits at the "leaf" end of your dependency graph. It consumes outputs from upstream modules (EKS, IAM) and creates Kubernetes manifests directly, so no other Terraform module depends on its results.
+
+However, adding an outputs.tf to modules/karpenter_resources is standard practice for clean module design—it lets you inspect created manifests and explicitly surface status flags to your root environment.
+
+modules/karpenter_resources/outputs.tf
+Create modules/karpenter_resources/outputs.tf with the following definition:
+
+Terraform
+output "ec2_node_class_name" {
+  description = "The metadata name of the applied Karpenter EC2NodeClass CRD"
+  value       = kubectl_manifest.ec2_node_class.name
+}
+
+output "node_pool_name" {
+  description = "The metadata name of the applied Karpenter NodePool CRD"
+  value       = kubectl_manifest.node_pool.name
+}
+
+output "karpenter_helm_release_status" {
+  description = "Status of the deployed Karpenter Helm release"
+  value       = helm_release.karpenter.status
+}
+Pass Through to Root (environments/prod/outputs.tf)
+To expose these details at the root level when running terraform apply, add them to environments/prod/outputs.tf:
+
+Terraform
+output "karpenter_node_pool_name" {
+  description = "Name of the Karpenter NodePool handling dynamic scaling"
+  value       = module.karpenter_resources.node_pool_name
+}
+
+output "karpenter_helm_status" {
+  description = "Helm deployment status for Karpenter"
+  value       = module.karpenter_resources.karpenter_helm_release_status
+}
+Okay, this project would be launched in a private subnet how can I communicate with the cluster through kubectl?
+
+Because your EKS control plane API endpoint has public access disabled (cluster_endpoint_public_access = false), standard kubectl commands from your local computer will fail to reach the cluster directly.
+
+There are three standard enterprise patterns to access a private EKS cluster safely:
+
+Option 1: AWS SSM Session Manager Bastion (Easiest & Cheapest)
+You deploy a lightweight, cheap EC2 instance (bastion) into your VPC private subnet running the AWS Systems Manager (SSM) Agent. You use aws ssm start-session to tunnel your local kubectl requests through SSH/SSM directly to the private API server.
+
+[ Your Laptop ] ──SSM Tunnel via AWS CLI──> [ AWS SSM Agent ] ──> [ Private EKS Endpoint ]
+                                              (Private Subnet)
+How to implement via Terraform:
+Add a minimal EC2 instance in modules/vpc with the AmazonSSMManagedInstanceCore IAM policy attached—no open inbound SSH ports required.
+
+How to connect from your local machine:
+Use the AWS CLI SSM plugin to port-forward the EKS private endpoint to your localhost:
+
+Bash
+# Start an SSM port forward to the private cluster API (port 443)
+aws ssm start-session \
+  --target i-0123456789example \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["YOUR_EKS_PRIVATE_ENDPOINT_IP"],"portNumber":["443"],"localPortNumber":["6443"]}'
+Option 2: AWS Client VPN (Best User Experience for Teams)
+Set up an AWS Client VPN Endpoint associated with your VPC's private subnets.
+
+[ Developer Laptop ] ────── OpenVPN Client ──────> [ AWS Client VPN ] ──> [ EKS Private API ]
+How it works:
+Connect via an OpenVPN-compatible client (or AWS VPN Client) using Mutual TLS or AWS IAM Identity Center (SSO).
+
+Once connected, your local machine receives a virtual IP inside your VPC route table.
+
+Standard kubectl commands work natively without extra port-forwarding scripts:
+
+Bash
+aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
+kubectl get pods -A
+Option 3: Teleport / Boundary (Production Zero-Trust Architecture)
+In high-security enterprise environments, tools like Gravitational Teleport or HashiCorp Boundary are deployed inside the cluster.
+
+Developers authenticate against an Identity Provider (Okta, Azure AD, Keycloak).
+
+Teleport acts as an identity-aware proxy inside the VPC, logging and auditing every kubectl command executed without requiring open network access or static VPN certificates.
+
+Summary Recommendation
+For quick testing / initial dev setup: Use Option 1 (AWS SSM Tunnel)—costs under $5/month and requires no additional infrastructure setup.
+
+For full engineering teams: Implement Option 2 (AWS Client VPN) for seamless developer access across dev, staging, and prod.
+
+What would the AWS Client VPN module cost?
+
+An AWS Client VPN consists of two separate billing components plus data transfer fees:
+
+1. Core Cost Breakdown
+Component	Price (US Regions)	Billing Type
+Endpoint Subnet Association	$0.10 / hour per subnet	Continuous (24/7 once associated)
+Active Client Connection	$0.05 / hour per connected user	Pay-per-use (prorated by minute)
+Data Transfer Out	Standard AWS DTO rates (~$0.09/GB)	Usage-based
+2. Practical Monthly Scenarios
+Scenario A: Single Availability Zone (Cost-Optimized)
+You associate 1 subnet for baseline connectivity:
+
+Fixed Endpoint Cost: 1 subnet × $0.10/hr × 730 hrs = ~$73.00/month
+
+Active Connections: 2 developers connected 40 hrs/week (~160 hrs total/mo)
+
+160 hrs × $0.05/hr = $8.00/month
+
+Total Estimated Cost: ~$81.00 / month
+
+Scenario B: High-Availability (Multi-AZ Setup)
+You associate 2 subnets across two Availability Zones for high availability:
+
+Fixed Endpoint Cost: 2 subnets × $0.10/hr × 730 hrs = ~$146.00/month
+
+Active Connections: 5 developers connected 40 hrs/week (~800 hrs total/mo)
+
+800 hrs × $0.05/hr = $40.00/month
+
+Total Estimated Cost: ~$186.00 / month
+
+3. Key Cost Factors to Keep in Mind
+Subnet Associations: You are billed per associated subnet. If you associate 3 subnets across 3 AZs, the fixed infrastructure fee alone is ~$219/month regardless of user activity.
+
+Always-On Connections: If engineers leave their VPN connections running 24/7 (730 hours/month), a single connection costs ~$36.50/month. Setting an idle timeout in the endpoint settings reduces unnecessary costs.
+
+Split Tunneling: Enable Split Tunneling in your configuration so only traffic destined for the VPC subnets routes through the VPN. This prevents paying AWS Data Transfer Out rates for general internet traffic (like streaming or web browsing).
+
+Summary Comparison
+AWS SSM Bastion (Option 1): ~$3–$5/month (runs on a single t3.micro / t4g.micro EC2 instance).
+
+AWS Client VPN (Option 2): ~$80–$180+/month depending on AZ redundancies and team usage.
+
+what if I launch a t3.micro in the same VPC in the public subnet?
+
+Launching a t3.micro EC2 instance in a public subnet inside the same VPC is a standard, cost-effective way to manage a private EKS cluster.
+
+[ Your Laptop ] ──SSM Session / SSH──> [ t3.micro Bastion ] ──> [ Private EKS Endpoint ]
+                                       (Public Subnet)         (Private Subnet)
+Cost & Performance Impact
+Cost: ~$7.50 / month (or $0.00 if eligible for the AWS Free Tier of 750 hours/month of t2.micro/t3.micro).
+
+Performance: Sufficient for running kubectl, helm, and administrative scripts.
+
+Two Access Patterns for a Public Bastion
+Pattern 1: SSM Session Manager (Recommended — Zero Open Inbound Ports)
+Even though the EC2 instance sits in a public subnet, you do not need an Elastic IP or open port 22. You connect using the AWS SSM Agent via IAM authentication.
+
+Bash
+# 1. Connect directly to the bastion shell
+aws ssm start-session --target i-0123456789example
+
+# 2. Or tunnel kubectl requests from your local machine through the bastion
+aws ssm start-session \
+  --target i-0123456789example \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["<EKS_PRIVATE_API_ENDPOINT>"],"portNumber":["443"],"localPortNumber":["6443"]}'
+Pattern 2: Standard SSH Tunneling
+You assign an Elastic IP to the instance and open port 22 in its Security Group (restricted to your home/office IP address).
+
+Bash
+# SSH SOCKS proxy tunnel to route kubectl commands
+ssh -i key.pem -D 1080 ec2-user@<BASTION_PUBLIC_IP>
+Required Configuration Changes for Private EKS
+To allow the bastion to talk to your cluster, you must configure two settings:
+
+VPC Subnet Route Tables: Ensure the public subnet has an Internet Gateway (0.0.0.0/0 -> igw-xxxx) attached so SSM or SSH can communicate externally.
+
+EKS Security Group Rule: Add an inbound rule on the EKS Cluster Security Group allowing TCP port 443 from the Bastion Instance's Security Group.
+
+Terraform Implementation Module
+You can add this as a module (modules/bastion/main.tf):
+
+Terraform
+data "aws_ami" "amazon_linux_2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-x86_64"]
+  }
+}
+
+resource "aws_security_group" "bastion_sg" {
+  name        = "${var.cluster_name}-bastion-sg"
+  description = "Security group for EKS Bastion host"
+  vpc_id      = var.vpc_id
+
+  # Outbound HTTPS for SSM Agent & Kubernetes API
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-bastion-sg"
+  }
+}
+
+# IAM Role allowing SSM Session Manager access without SSH keys
+resource "aws_iam_role" "bastion_role" {
+  name = "${var.cluster_name}-bastion-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_policy" {
+  role       = aws_iam_role.bastion_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "${var.cluster_name}-bastion-profile"
+  role = aws_iam_role.bastion_role.name
+}
+
+resource "aws_instance" "bastion" {
+  ami                  = data.aws_ami.amazon_linux_2023.id
+  instance_type        = "t3.micro"
+  subnet_id            = var.public_subnet_id
+  vpc_security_group_ids = [aws_security_group.bastion_sg.id]
+  iam_instance_profile = aws_iam_instance_profile.bastion_profile.name
+
+  user_data = <<-EOF
+              #!/bin/bash
+              dnf update -y
+              dnf install -y kubectl awscli git
+              EOF
+
+  tags = {
+    Name = "${var.cluster_name}-bastion"
+  }
+}
+
+# Allow Bastion to communicate with private EKS Control Plane
+resource "aws_security_group_rule" "allow_bastion_to_eks" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = var.eks_cluster_security_group_id
+  source_security_group_id = aws_security_group.bastion_sg.id
+  description              = "Allow HTTPS traffic from Bastion Host"
+}
+Okay, how can I integrate the SSM into the terraform code so that once the cluster is launched it can simply give me the command that needs to be run to connect to the cluster?
+
+To make this seamless, you can deploy a dedicated SSM Bastion module in your Terraform code and output the exact commands needed to establish an SSM tunnel and route kubectl through it.
+
+Step 1: Create the Bastion Module (modules/bastion/)
+Create a new directory modules/bastion/ and add the following three files:
+
+modules/bastion/variables.tf
+Terraform
+variable "cluster_name" { type = string }
+variable "vpc_id" { type = string }
+variable "public_subnet_id" { type = string }
+variable "eks_cluster_security_group_id" { type = string }
+modules/bastion/main.tf
+Terraform
+# 1. Fetch latest Amazon Linux 2023 AMI
+data "aws_ami" "amazon_linux_2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-x86_64"]
+  }
+}
+
+# 2. Bastion Security Group (No Inbound SSH Required)
+resource "aws_security_group" "bastion_sg" {
+  name        = "${var.cluster_name}-bastion-sg"
+  description = "Security group for EKS SSM Bastion host"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-bastion-sg"
+  }
+}
+
+# 3. Allow Bastion to speak to EKS API on Port 443
+resource "aws_security_group_rule" "allow_bastion_to_eks" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = var.eks_cluster_security_group_id
+  source_security_group_id = aws_security_group.bastion_sg.id
+  description              = "Allow HTTPS traffic from Bastion Host"
+}
+
+# 4. IAM Role for Systems Manager (SSM)
+resource "aws_iam_role" "bastion_role" {
+  name = "${var.cluster_name}-bastion-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_policy" {
+  role       = aws_iam_role.bastion_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "${var.cluster_name}-bastion-profile"
+  role = aws_iam_role.bastion_role.name
+}
+
+# 5. Bastion Instance
+resource "aws_instance" "bastion" {
+  ami                  = data.aws_ami.amazon_linux_2023.id
+  instance_type        = "t3.micro"
+  subnet_id            = var.public_subnet_id
+  vpc_security_group_ids = [aws_security_group.bastion_sg.id]
+  iam_instance_profile = aws_iam_instance_profile.bastion_profile.name
+
+  tags = {
+    Name = "${var.cluster_name}-bastion"
+  }
+}
+modules/bastion/outputs.tf
+Terraform
+output "instance_id" {
+  value = aws_instance.bastion.id
+}
+Step 2: Update Module Dependencies
+We need the public_subnets from modules/vpc and the cluster's primary security group ID from modules/eks_control_plane.
+
+Update modules/vpc/outputs.tf:
+Terraform
+output "vpc_id" { value = module.vpc.vpc_id }
+output "private_subnets" { value = module.vpc.private_subnets }
+output "public_subnets" { value = module.vpc.public_subnets } # Added
+Update modules/eks_control_plane/outputs.tf:
+Terraform
+output "cluster_name" { value = module.eks.cluster_name }
+output "cluster_endpoint" { value = module.eks.cluster_endpoint }
+output "cluster_certificate_authority_data" { value = module.eks.cluster_certificate_authority_data }
+output "cluster_primary_security_group_id" { value = module.eks.cluster_primary_security_group_id } # Added
+Step 3: Call the Bastion Module and Generate Connection Commands
+Add the bastion module to environments/prod/main.tf:
+
+Terraform
+module "bastion" {
+  source = "../../modules/bastion"
+
+  cluster_name                  = module.eks.cluster_name
+  vpc_id                        = module.vpc.vpc_id
+  public_subnet_id              = module.vpc.public_subnets[0]
+  eks_cluster_security_group_id = module.eks.cluster_primary_security_group_id
+}
+Now, create the automated connection string in environments/prod/outputs.tf:
+
+Terraform
+# Clean extract of host domain without "https://" prefix
+locals {
+  eks_endpoint_host = replace(module.eks.cluster_endpoint, "https://", "")
+}
+
+output "connect_step_1_start_ssm_tunnel" {
+  description = "Run this command in Terminal 1 to start port-forwarding traffic to the private EKS API"
+  value       = "aws ssm start-session --target ${module.bastion.instance_id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '{\"host\":[\"${local.eks_endpoint_host}\"],\"portNumber\":[\"443\"],\"localPortNumber\":[\"8443\"]}'"
+}
+
+output "connect_step_2_setup_kubeconfig" {
+  description = "Run this in Terminal 2 to point your local kubectl to the forwarded tunnel"
+  value       = "aws eks update-kubeconfig --name ${module.eks.cluster_name} && kubectl config set-cluster arn:aws:eks:${var.aws_region}:$(aws sts get-caller-identity --query Account --output text):cluster/${module.eks.cluster_name} --server=https://localhost:8443"
+}
+How You Connect After Running terraform apply
+When Terraform completes, it will display the connection instructions directly on your screen:
+
+Bash
+Outputs:
+
+connect_step_1_start_ssm_tunnel = "aws ssm start-session --target i-0abcd1234efgh5678 --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '{"host":["1234567890ABCDEF.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'"
+
+connect_step_2_setup_kubeconfig = "aws eks update-kubeconfig --name prod-eks-karpenter && kubectl config set-cluster arn:aws:eks:us-east-1:123456789012:cluster/prod-eks-karpenter --server=https://localhost:8443"
+Terminal 1: Copy-paste connect_step_1_start_ssm_tunnel and leave it running. This opens an SSM encrypted tunnel to your private cluster via port 8443.
+
+Terminal 2: Copy-paste connect_step_2_setup_kubeconfig.
+
+Verify: Run kubectl get pods -A from your local terminal. All traffic routes through the SSM tunnel into the private EKS cluster.
+
+╷
+
+│ Error: Incorrect attribute value type
+
+│ 
+
+│   on ../../modules/bastion/main.tf line 34, in resource "aws_security_group_rule" "allow_bastion_to_eks":
+
+│   34:   source_security_group_id = aws_security_group.bastion_sg
+
+│     ├────────────────
+
+│     │ aws_security_group.bastion_sg is object with 13 attributes
+
+│ 
+
+│ Inappropriate value for attribute "source_security_group_id": string required.
+
+╵
+
+Releasing state lock. This may take a few moments...
+
+
+
+Getting this on plan
+
+This error occurs because source_security_group_id expects a String (the ID of the security group), but you passed the entire Resource Object (aws_security_group.bastion_sg).
+
+Fix
+In modules/bastion/main.tf, append .id to the reference on line 34:
+
+Terraform
+# modules/bastion/main.tf
+
+resource "aws_security_group_rule" "allow_bastion_to_eks" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = var.eks_cluster_security_group_id
+  source_security_group_id = aws_security_group.bastion_sg.id # <-- Add .id here
+  description              = "Allow HTTPS traffic from Bastion Host"
+}
+Once updated, run terraform plan again and the error will be resolved.
+
+Is it possible that if I launch eks with a kubernetes version that is not supported by aws eks it stucks in the launch state or it throws error?
+
+It will throw an immediate validation error during creation (or fail fast during terraform plan / aws eks create-cluster), rather than getting stuck indefinitely in a launching/creating state.
+
+1. What Happens at Creation Time
+When you request an EKS cluster with an unsupported Kubernetes version:
+
+Terraform (terraform plan / apply): AWS API returns an InvalidParameterException or ClientException almost immediately:
+
+Error: creating EKS Cluster: InvalidParameterException: Unsupported Kubernetes version
+
+AWS Console / CLI: The API refuses to accept the payload, and cluster creation is never initiated.
+
+2. Why EKS Clusters Get Stuck in CREATING (Real Causes)
+If your EKS cluster ever gets stuck in the CREATING state (often timing out after 20–30 minutes), it is almost always caused by network/VPC misconfigurations, not the Kubernetes version:
+
+Missing Subnet Tags / Route Issues: The EKS control plane network interfaces (ENIs) cannot establish communication within your VPC subnets.
+
+Insufficient Available IPs: Your target subnets do not have enough free IP addresses (EKS requires at least 6 free IPs per subnet for cross-account elastic network interfaces).
+
+IAM Role Issues: The IAM role assigned to the EKS cluster (cluster_service_role) is missing the required AWS-managed policies (AmazonEKSClusterPolicy).
+
+3. EKS Version Support Window (2026 Reference)
+AWS EKS supports standard versions for 14 months, followed by Extended Support for up to 26 months:
+
+Kubernetes Version	EKS Support Status
+v1.28 – v1.32+	Fully Supported / Extended Support
+v1.23 – v1.27	End of Life (Creation requests rejected by AWS API)
+Summary: You don't need to worry about an invalid version causing an infinite hang. If the version is obsolete, AWS will fail fast and report the error instantly.
+
+It failed with an error unfortunately I don't have the error is there a way I can get the error?
+
+
+
+I have run terraform destroy now.
+
+Even after running terraform destroy, you can still retrieve the exact error message and execution history through a few different methods:
+
+1. Check the Local Terraform Crash/Log File
+If Terraform encountered an unhandled panic or crashed, it writes a detailed crash log directly to your current directory:
+
+Bash
+# Search for terraform crash logs in your current working directory
+ls -la crash.log crash-*.log 2>/dev/null
+If present, view the last few lines:
+
+Bash
+cat crash.log | tail -n 50
+2. Check AWS CloudTrail Events
+Every call Terraform makes to AWS API endpoints (like CreateCluster or CreateNodegroup) is permanently logged in AWS CloudTrail, even if local state or resources are deleted.
+
+Run this AWS CLI command to view recent API errors for EKS:
+
+Bash
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventSource,AttributeValue=eks.amazonaws.com \
+  --query 'Events[?ErrorCode!=`null`].[EventTime, EventName, ErrorCode, ErrorMessage]' \
+  --output table
+To see all failed API calls across your AWS account in the last hour:
+
+Bash
+aws cloudtrail lookup-events \
+  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --query 'Events[?ErrorCode!=`null`].[EventTime, EventName, ErrorCode, ErrorMessage]' \
+  --output table
+3. Capture Logs on Next Run (Terraform Debug Mode)
+When you re-run terraform apply, enable verbose logging so any failures are captured to a dedicated log file:
+
+Bash
+# Enable trace-level logging to a file
+TF_LOG=DEBUG TF_LOG_PATH="terraform-debug.log" terraform apply -auto-approve
+If it fails again, inspect the file for errors:
+
+Bash
+grep -i "error" terraform-debug.log | tail -n 30
+Here is the last 30 lines containing error keyword.
+
+hashicorp/aws @caller=github.com/hashicorp/aws-sdk-go-base/v2@v2.0.0-beta.65/logging/tf_logger.go:45 @module=aws aws.region=us-east-1 rpc.method=CreateNodegroup rpc.service=EKS tf_req_id=53ca23d8-75f4-1fc2-94bd-85ae3e2a1802 tf_resource_type=aws_eks_node_group tf_rpc=ApplyResourceChange rpc.system=aws-api tf_mux_provider="*schema.GRPCProviderServer" timestamp="2026-08-31T17:49:51.960+0200"
+
+2026-08-31T17:49:51.960+0200 [ERROR] provider.terraform-provider-aws_v5.100.0_x5: Response contains error diagnostic: @module=sdk.proto diagnostic_detail="" diagnostic_severity=ERROR tf_proto_version=5.8 tf_provider_addr=registry.terraform.io/hashicorp/aws @caller=github.com/hashicorp/terraform-plugin-go@v0.26.0/tfprotov5/internal/diag/diagnostics.go:58 diagnostic_summary="creating EKS Node Group (prod-eks-karpenter:system-addons-20260831154951414100000022): operation error EKS: CreateNodegroup, https response error StatusCode: 400, RequestID: 34c960a7-7a1e-439f-93c6-6013f0948e29, InvalidParameterException: Requested AMI for this version 1.30 is not supported" tf_req_id=53ca23d8-75f4-1fc2-94bd-85ae3e2a1802 tf_resource_type=aws_eks_node_group tf_rpc=ApplyResourceChange timestamp="2026-08-31T17:49:51.960+0200"
+
+2026-08-31T17:49:51.961+0200 [ERROR] vertex "module.eks.module.eks.module.eks_managed_node_group[\"system_nodes\"].aws_eks_node_group.this[0]" error: creating EKS Node Group (prod-eks-karpenter:system-addons-20260831154951414100000022): operation error EKS: CreateNodegroup, https response error StatusCode: 400, RequestID: 34c960a7-7a1e-439f-93c6-6013f0948e29, InvalidParameterException: Requested AMI for this version 1.30 is not supported
+
+2026-08-31T17:49:53.210+0200 [DEBUG] provider.stdio: received EOF, stopping recv loop: err="rpc error: code = Unavailable desc = error reading from server: EOF"
+
+2026-08-31T17:49:53.210+0200 [DEBUG] provider.stdio: received EOF, stopping recv loop: err="rpc error: code = Unavailable desc = error reading from server: EOF"
+
+2026-08-31T17:49:53.210+0200 [DEBUG] provider.stdio: received EOF, stopping recv loop: err="rpc error: code = Unavailable desc = error reading from server: EOF" 
+
+The root cause of your deployment failure is in line 2:
+
+Plaintext
+InvalidParameterException: Requested AMI for this version 1.30 is not supported
+Why This Happened
+When using Kubernetes v1.30+, AWS deprecated Amazon Linux 2 (AL2_x86_64) as the default operating system for managed node groups in favor of Amazon Linux 2023 (AL2023_x86_64_STANDARD).
+
+If your node group configuration explicitly specifies ami_type = "AL2_x86_64" (or leaves it unset on an older module version that defaults to AL2_x86_64), AWS rejects the node group creation request with this exact error.
+
+Step 1: Fix the ami_type in modules/eks_control_plane
+Locate your EKS module configuration where system_nodes (or managed node groups) are defined, and set the AMI type to either AL2023_x86_64_STANDARD or BOTTLEROCKET_x86_64.
+
+Option A: Upgrade to Amazon Linux 2023 (Recommended)
+Terraform
+eks_managed_node_groups = {
+  system_nodes = {
+    name           = "system-addons"
+    instance_types = ["m6i.large"]
+    
+    # Update AMI type for Kubernetes 1.30+
+    ami_type       = "AL2023_x86_64_STANDARD"
+    
+    min_size     = 2
+    max_size     = 3
+    desired_size = 2
+  }
+}
+Option B: Use Bottlerocket OS
+If you want your system node group aligned with Bottlerocket OS (matching Karpenter's dynamic nodes):
+
+Terraform
+eks_managed_node_groups = {
+  system_nodes = {
+    name           = "system-addons"
+    instance_types = ["m6i.large"]
+    
+    ami_type       = "BOTTLEROCKET_x86_64"
+    platform       = "bottlerocket"
+    
+    min_size     = 2
+    max_size     = 3
+    desired_size = 2
+  }
+}
+Step 2: Clear Out Dated State and Apply
+Since you already ran terraform destroy, purge any remaining local cache to ensure fresh parameters:
+
+Bash
+# Clean local cache state
+rm -rf .terraform/ .terraform.lock.hcl
+
+# Re-initialize and apply
+terraform init
+terraform apply
+eks_managed_node_groups = {
+
+    system_nodes = {
+
+      name          = "system-addons"
+
+      instance_type = ["t3.medium"]
+
+      min_size      = var.system_node_min
+
+      max_size      = var.system_node_max
+
+      desired_size  = var.system_node_desired
+
+
+
+      subnet_ids = var.subnet_ids
+
+
+
+      labels = { "workload.type" = "system" }
+
+      taints = [{
+
+        key    = "CriticalAddonsOnly"
+
+        value  = "true"
+
+        effect = "NO_SCHEDULE"
+
+      }]
+
+
+
+      metadata_options = {
+
+        http_endpoint               = "enabled"
+
+        http_tokens                 = "required"
+
+        http_put_response_hop_limit = 1
+
+      }
+
+   
+
+
+
+I don't have any thing in the eks_managed_node_group.
+
+You hit two specific issues in this block: a syntax typo in your instance configuration and a missing explicit AMI type required by Kubernetes 1.30+.
+
+1. Syntax Typo: instance_type vs instance_types
+In your code block, you wrote instance_type = ["t3.medium"] (singular). The Terraform AWS EKS module expects instance_types (plural) as a list.
+
+2. Missing ami_type for Kubernetes 1.30+
+Because no ami_type was specified, your current module version fell back to the legacy AL2_x86_64 (Amazon Linux 2), which AWS has deprecated for EKS 1.30+, triggering your Requested AMI for this version 1.30 is not supported error.
+
+Corrected Configuration
+Add ami_type = "AL2023_x86_64_STANDARD" and fix the plural key name:
+
+Terraform
+eks_managed_node_groups = {
+  system_nodes = {
+    name           = "system-addons"
+    
+    # 1. Fix: Explicitly set Amazon Linux 2023 for EKS 1.30+
+    ami_type       = "AL2023_x86_64_STANDARD"
+    
+    # 2. Fix: Must be instance_types (plural)
+    instance_types = ["t3.medium"]
+    
+    min_size     = var.system_node_min
+    max_size     = var.system_node_max
+    desired_size = var.system_node_desired
+
+    subnet_ids = var.subnet_ids
+
+    labels = { "workload.type" = "system" }
+    taints = [{
+      key    = "CriticalAddonsOnly"
+      value  = "true"
+      effect = "NO_SCHEDULE"
+    }]
+
+    metadata_options = {
+      http_endpoint               = "enabled"
+      http_tokens                 = "required"
+      http_put_response_hop_limit = 1
+    }
+  }
+}
+Alternative: Bottlerocket OS
+If you prefer running Bottlerocket on your managed system nodes to match Karpenter's dynamic nodes, replace ami_type with:
+
+Terraform
+ami_type = "BOTTLEROCKET_x86_64"
+platform = "bottlerocket"
+│ Error: creating AWS EKS (Elastic Kubernetes) Pod Identity Association (<unknown>): operation error EKS: CreatePodIdentityAssociation, https response error StatusCode: 404, RequestID: bee62201-f8fa-447b-92ed-9439b39a3718, ResourceNotFoundException: No cluster found for name: prod-eks-karpenter.
+
+│ 
+
+│   with module.karpenter_iam.module.karpenter_iam.aws_eks_pod_identity_association.karpenter[0],
+
+│   on .terraform/modules/karpenter_iam.karpenter_iam/modules/karpenter/main.tf line 121, in resource "aws_eks_pod_identity_association" "karpenter":
+
+│  121: resource "aws_eks_pod_identity_association" "karpenter" {
+
+│ 
+
+│ operation error EKS: CreatePodIdentityAssociation, https response error StatusCode: 404, RequestID: bee62201-f8fa-447b-92ed-9439b39a3718, ResourceNotFoundException: No
+
+│ cluster found for name: prod-eks-karpenter.
+
+╵
+
+
+
+Getting this error now.
+
+This error occurs because aws_eks_pod_identity_association is attempting to make an AWS API call to associate an IAM role before the EKS Cluster control plane has finished creating.
+
+Because Terraform evaluates resources in parallel without an explicit dependency link pointing directly from the Pod Identity module back to the EKS Cluster resource, it fires off CreatePodIdentityAssociation while the cluster is non-existent, triggering a 404 ResourceNotFoundException.  
+Stack Overflow
+
+The Fix: Add depends_on Dependency
+Pass an explicit dependency on the EKS module inside the karpenter_iam module call in your root environments/prod/main.tf.
+
+In environments/prod/main.tf
+Locate your karpenter_iam module invocation and add depends_on = [module.eks]:
+
+Terraform
+module "karpenter_iam" {
+  source = "terraform-aws-modules/eks-pod-identity/aws"
+  version = "~> 1.0" # or your module reference
+
+  name = "karpenter"
+  
+  # Pod identity configurations
+  association_defaults = {
+    namespace       = "karpenter"
+    service_account = "karpenter"
+  }
+
+  attach_karpenter_controller_policy = true
+  karpenter_controller_cluster_name  = module.eks.cluster_name
+  karpenter_controller_node_iam_role_arns = [
+    module.eks.eks_managed_node_groups["system_nodes"].iam_role_arn
+  ]
+
+  # ✅ FIX: Prevent race condition by forcing EKS Cluster creation first
+  depends_on = [
+    module.eks
+  ]
+}
+Alternative: Passing cluster_name via Module Output
+If your karpenter_iam module takes cluster_name directly, make sure it relies on the output attribute module.eks.cluster_name rather than a variable string like var.cluster_name. This forces Terraform's implicit graph solver to wait for the EKS module output.
+
+Terraform
+# ❌ Avoid: Using var directly breaks implicit dependency ordering
+# cluster_name = var.cluster_name 
+
+# ✅ Recommended: Using module output creates an implicit dependency graph link
+cluster_name = module.eks.cluster_name
+Re-applying the Infrastructure
+Run standard target-based execution or re-run apply:
+
+Bash
+terraform apply
+Getting this error now.
+
+module.karpenter_resources.helm_release.karpenter: Still creating... [00m30s elapsed]
+
+╷
+
+│ Error: Kubernetes cluster unreachable: Get "https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/version": dial tcp 10.100.15.29:443: i/o timeout
+
+│ 
+
+│   with module.karpenter_resources.helm_release.karpenter,
+
+│   on ../../modules/karpenter_resources/main.tf line 1, in resource "helm_release" "karpenter":
+
+│    1: resource "helm_release" "karpenter" {
+
+│ 
+
+╵
+
+This error (dial tcp 10.100.15.29:443: i/o timeout) occurs because your local Terraform client is attempting to deploy the Karpenter Helm chart by contacting the EKS API endpoint directly over the internet.
+
+Because your cluster API endpoint is private-only (cluster_endpoint_public_access = false), your local machine cannot route directly to the cluster's private IP (10.100.15.29).
+
+Why This Happens in Terraform
+The helm and kubectl Terraform providers run locally on your machine during terraform apply. When they try to configure resources inside a private EKS cluster, the network request times out because standard internet routing cannot reach the VPC's private subnets.
+
+Solution: Target-Based 2-Phase Apply
+To resolve this cleanly without changing your Zero-Trust architecture, split the deployment into two distinct phases using Terraform targets:
+
+Phase 1: Deploy Core AWS Infrastructure
+Provision the VPC, EKS Cluster, System Nodes, IAM Roles, and SSM Bastion without calling the helm or kubectl providers.
+
+Bash
+terraform apply -target=module.vpc -target=module.eks -target=module.karpenter_iam -target=module.bastion
+Phase 2: Establish SSM Tunnel & Deploy Kubernetes Resources
+Once Phase 1 completes, Terraform will output the SSM tunnel command generated by your Bastion module.
+
+Open Terminal 1 (Start SSM Tunnel):
+Run the command surfaced in your Terraform outputs (connect_step_1_start_ssm_tunnel):
+
+Bash
+aws ssm start-session \
+  --target i-xxxxxxxxxxxxxxxxx \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+(Keep this terminal open and running)
+
+Configure Local Environment:
+In your working terminal, instruct your local Kubernetes context and Terraform providers to route traffic through localhost:8443:
+
+Bash
+aws eks update-kubeconfig --name prod-eks-karpenter
+kubectl config set-cluster arn:aws:eks:us-east-1:123456789012:cluster/prod-eks-karpenter --server=https://localhost:8443
+Open Terminal 2 (Complete Full Apply):
+Ensure your helm / kubernetes provider configuration in providers.tf points to https://localhost:8443 (or uses standard kubeconfig context), then run:
+
+Bash
+terraform apply
+Standard Helm Provider Setup for Private Clusters
+Ensure your providers.tf file configures the Helm provider via the local proxy tunnel:
+
+Terraform
+provider "helm" {
+  kubernetes {
+    host                   = "https://localhost:8443"
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+    
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    }
+  }
+}
+aws ssm start-session --target i-0c2d72e33d271e1b5 --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '{\"host\":[\"8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com\"],\"postNumber\":[\"443\"],\"localPortNumber\":[\"8443\"]}'
+
+
+
+Error parsing parameter '--parameters': Invalid JSON: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+
+JSON received: {\"host\":[\"8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com\"],\"postNumber\":[\"443\"],\"localPortNumber\":[\"8443\"]}
+
+The error occurs because your shell (Bash/Zsh) is passing the literal backslashes (\") into the AWS CLI, rendering the JSON string invalid. Additionally, there is a typo in the parameter name (postNumber instead of portNumber).
+
+The Fix
+Use single quotes around the JSON string without escaping the internal double quotes:
+
+Bash
+aws ssm start-session \
+  --target i-0c2d72e33d271e1b5 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+Fixing the Terraform Output Definition
+To prevent Terraform from inserting escaped backslashes into your command outputs in the future, update the output block in environments/prod/outputs.tf to use jsonencode():
+
+Terraform
+output "connect_step_1_start_ssm_tunnel" {
+  description = "Run this command in Terminal 1 to start port-forwarding"
+  value       = "aws ssm start-session --target ${module.bastion.instance_id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '${jsonencode({
+    host            = [local.eks_endpoint_host]
+    portNumber      = ["443"]
+    localPortNumber = ["8443"]
+  })}'"
+}
+Once the SSM session is established in Terminal 1, proceed with setting up your kubeconfig and running terraform apply in Terminal 2.
+
+An error occurred (TargetNotConnected) when calling the StartSession operation: i-0c2d72e33d271e1b5 is not connected.
+
+The TargetNotConnected error means AWS Systems Manager (SSM) cannot communicate with the agent inside your bastion EC2 instance. When an EC2 instance is first launched, it takes 1 to 3 minutes for the SSM agent to register online with the AWS Systems Manager control plane.
+
+Run the following checks to diagnose and fix the connection:
+
+Step 1: Check if the Bastion is Online in SSM
+Run this AWS CLI command to see if AWS recognizes your instance as a managed node:
+
+Bash
+aws ssm describe-instance-information \
+  --filters "Key=InstanceIds,Values=i-0c2d72e33d271e1b5" \
+  --query "InstanceInformationList[*].[InstanceId,PingStatus,LastPingDateTime]" \
+  --output table
+If empty or PingStatus is ConnectionLost: The instance is still initializing, missing internet route access, or lacking proper IAM permissions.
+
+If PingStatus is Online: Retry your aws ssm start-session command—it was likely just executed too quickly after creation.
+
+Step 2: Common Root Causes & Infrastructure Fixes
+If it stays offline after waiting 3 minutes, verify these three configuration requirements in your Terraform code:
+
+1. Outbound Internet Access (Public Subnet Route Table)
+The bastion instance needs outbound access to port 443 (HTTPS) to reach the AWS SSM service endpoints (ssm.us-east-1.amazonaws.com).  
+Alexander Hose
+
+Ensure the public subnet where the bastion is deployed has a route pointing to an Internet Gateway:
+
+Terraform
+# Route table for public subnet
+route {
+  cidr_block = "0.0.0.0/0"
+  gateway_id = aws_internet_gateway.main.id
+}
+2. Security Group Outbound Traffic
+Verify that aws_security_group.bastion_sg allows outbound HTTPS traffic (port 443 or all traffic -1) to 0.0.0.0/0:  
+Alexander Hose
+
+Terraform
+resource "aws_security_group" "bastion_sg" {
+  name   = "${var.cluster_name}-bastion-sg"
+  vpc_id = var.vpc_id
+
+  # ✅ Must allow outbound access so the SSM agent can reach AWS endpoints
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+3. IAM Instance Profile
+Verify that the AmazonSSMManagedInstanceCore policy is attached to your IAM role and that the aws_iam_instance_profile is assigned to the aws_instance.bastion resource.  
+Alexander Hose
+
+Step 3: Quick Terminal Retry
+Once the describe-instance-information command returns Online, re-run the port-forwarding tunnel command:
+
+Bash
+aws ssm start-session \
+  --target i-0c2d72e33d271e1b5 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+I think route table is missing can you let me know where I should add this?
+
+# Route table for public subnet
+
+route {
+
+  cidr_block = "0.0.0.0/0"
+
+  gateway_id = aws_internet_gateway.main.id
+
+}
+
+Where you place this configuration depends on how you built your VPC: using the official AWS VPC Terraform Module (terraform-aws-modules/vpc/aws) or using custom Terraform resources (aws_vpc, aws_route_table, etc.).
+
+Scenario A: You are using Custom Terraform Resources (modules/vpc/main.tf)
+If you wrote custom resources for your VPC, create a dedicated public route table and associate it with your public subnets:  
+Spacelift
+
+Terraform
+# 1. Route Table definition
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-public-rt"
+  }
+}
+
+# 2. Associate the Route Table with the Public Subnet where Bastion lives
+resource "aws_route_table_association" "public" {
+  count          = length(var.public_subnet_cidrs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+Scenario B: You are using the Official AWS VPC Module (modules/vpc/main.tf)
+If you are using terraform-aws-modules/vpc/aws, do not write standard resource "aws_route_table" blocks. The module creates and configures the Internet Gateway and Public Route Tables automatically when public subnets are passed:
+
+Terraform
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = var.cluster_name
+  cidr = "10.100.0.0/16"
+
+  azs             = ["us-east-1a", "us-east-1b"]
+  private_subnets = ["10.100.1.0/24", "10.100.2.0/24"]
+  
+  # ✅ Defining public_subnets automatically creates:
+  # 1. An Internet Gateway (IGW)
+  # 2. A Public Route Table with 0.0.0.0/0 -> IGW
+  # 3. Route table associations for these subnets
+  public_subnets  = ["10.100.101.0/24", "10.100.102.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true
+
+  tags = {
+    Environment = "prod"
+  }
+}
+How to Verify Which One to Fix
+If your Bastion is stuck at TargetNotConnected, check the following in AWS Console or CLI:
+
+Check Subnet Placement: Ensure public_subnet_id = module.vpc.public_subnets[0] is passed into your bastion module (and not a private subnet ID).
+
+Auto-Assign Public IP: Ensure the Bastion instance gets a public IP address:
+
+Terraform
+resource "aws_instance" "bastion" {
+  # ...
+  associate_public_ip_address = true  # Force public IP assignment
+}
+The bastion instance do have the IGW added to the public route table.
+
+Since the public route table and Internet Gateway are already in place, three primary culprits cause TargetNotConnected:  
+Alexander Hose
+
+Auto-Assign Public IP: The EC2 instance sits in a public subnet, but if associate_public_ip_address = true is not explicitly enabled, it launched without a public IP address—meaning it cannot reach AWS Systems Manager endpoints over the internet.
+
+Missing Outbound Security Group Rule: The instance's security group lacks an egress rule allowing outbound HTTPS (port 443) or all traffic (-1) to 0.0.0.0/0.  
+Alexander Hose
+
+Region Mismatch / AWS CLI Session: The local AWS CLI configuration profile points to a different region than where the bastion host lives (e.g., CLI default is us-west-2, but bastion is in us-east-1).  
+GitHub
+
+Step 1: Update modules/bastion/main.tf
+Ensure associate_public_ip_address = true and the egress rule are present:
+
+Terraform
+# modules/bastion/main.tf
+
+resource "aws_security_group" "bastion_sg" {
+  name        = "${var.cluster_name}-bastion-sg"
+  description = "Security group for EKS SSM Bastion host"
+  vpc_id      = var.vpc_id
+
+  # MUST allow outbound traffic to reach AWS SSM API endpoints over HTTPS
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.cluster_name}-bastion-sg"
+  }
+}
+
+resource "aws_instance" "bastion" {
+  ami                         = data.aws_ami.amazon_linux_2023.id
+  instance_type               = "t3.micro"
+  subnet_id                   = var.public_subnet_id
+  vpc_security_group_ids      = [aws_security_group.bastion_sg.id]
+  iam_instance_profile        = aws_iam_instance_profile.bastion_profile.name
+
+  # ✅ ENSURE PUBLIC IP IS ASSIGNED
+  associate_public_ip_address = true
+
+  tags = {
+    Name = "${var.cluster_name}-bastion"
+  }
+}
+Step 2: Force-Recreate the Bastion Host
+Apply the changes to force Terraform to re-provision the instance with a public IP:
+
+Bash
+terraform apply -target=module.bastion -auto-approve
+Step 3: Verify SSM Online Status (With Explicit Region)
+Wait ~60 seconds for the SSM agent inside the new instance to initialize, then check its status (pass --region explicitly to avoid region mismatch issues):  
+AWS re:Post
+
+Bash
+aws ssm describe-instance-information \
+  --region us-east-1 \
+  --query "InstanceInformationList[*].[InstanceId, PingStatus, IPAddress]" \
+  --output table
+Once PingStatus shows Online, re-run your tunnel command:
+
+Bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target <NEW_BASTION_INSTANCE_ID> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+Now it seems to be giving output.
+
+aws ssm describe-instance-information \
+
+  --region us-east-1 \
+
+  --query "InstanceInformationList[*].[InstanceId, PingStatus, IPAddress]" \
+
+  --output table
+
+----------------------------------------------------
+
+|            DescribeInstanceInformation           |
+
++----------------------+---------+-----------------+
+
+|  i-0f935f451f27d0a59 |  Online |  10.100.48.199  |
+
++----------------------+---------+-----------------+
+
+
+
+After assigning public IP.
+
+The SSM agent has connected and is reporting Online.
+
+Now you can run the two-terminal setup to establish your proxy tunnel and execute terraform apply for your cluster resources (like Karpenter).
+
+Step 1: Start the SSM Tunnel (Terminal 1)
+Execute the port-forwarding command in Terminal 1 and leave it running in the background:
+
+Bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target i-0f935f451f27d0a59 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+(You should see a message confirming the session started: Waiting for connections...)
+
+Step 2: Update Local Kubeconfig & Complete Apply (Terminal 2)
+In Terminal 2, direct your local kubectl configuration to talk to the local end of your SSM tunnel:
+
+Bash
+# 1. Generate standard kubeconfig
+aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
+
+# 2. Redirect cluster server URL to localhost:8443
+kubectl config set-cluster arn:aws:eks:us-east-1:$(aws sts get-caller-identity --query Account --output text):cluster/prod-eks-karpenter --server=https://localhost:8443
+
+# 3. Test cluster connectivity over the tunnel
+kubectl get nodes
+
+# 4. Finish full Terraform deployment
+terraform apply
+Verification
+If kubectl get nodes returns your system node pool and terraform apply completes without i/o timeout errors, your private EKS control plane deployment and Karpenter Helm releases are fully provisioned.
+
+Is this correct for fixing the output definition?
+
+  value       = "aws ssm start-session --target ${module.bastion.instance_id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '${jsonencode({\"host\":[\"${local.eks_endpoint_host}\"],\"postNumber\":[\"443\"],\"localPortNumber\":[\"8443\"]})}'"
+
+No, that line has two syntax/typo issues that will cause it to fail:
+
+Typo in parameter key ("postNumber" instead of "portNumber"): AWS Systems Manager will reject this because the key name must be portNumber.
+
+Double-escaped backslashes (\" inside HCL): In HCL, inside a jsonencode({ ... }) map, keys and values use standard HCL/JSON syntax. You do not need backslashes \" inside the object structure—adding them creates extra backslashes in the output string.
+
+Correct HCL Output Block
+Here is the clean, working configuration for environments/prod/outputs.tf:
+
+Terraform
+output "connect_step_1_start_ssm_tunnel" {
+  description = "Run this command in Terminal 1 to start port-forwarding"
+  value       = "aws ssm start-session --target ${module.bastion.instance_id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters '${jsonencode({
+    host            = [local.eks_endpoint_host]
+    portNumber      = ["443"]
+    localPortNumber = ["8443"]
+  })}'"
+}
+Why this works cleanly:
+No escaping required: jsonencode() handles double quotes for JSON formatting automatically.
+
+Clean shell execution: Wrapping the whole --parameters argument in single quotes '...' ensures your local terminal (Bash/Zsh) parses the JSON object properly without requiring manual string escaping.
+
+SessionManagerPlugin is not found. Please refer to SessionManager Documentation here: http://docs.aws.amazon.com/console/systems-manager/session-manager-plugin-not-found
+
+This error occurs because the AWS CLI relies on an external helper binary—the Session Manager plugin—to execute port-forwarding and interactive shell sessions over SSM.
+
+To fix this, install the plugin on your local operating system.
+
+Installation Instructions
+macOS
+Using Homebrew:
+
+Bash
+brew install --cask session-manager-plugin
+Or manually via PKG:
+
+Bash
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/sessionmanager-bundle.zip" -o "sessionmanager-bundle.zip"
+unzip sessionmanager-bundle.zip
+sudo ./sessionmanager-bundle/install -i /usr/local/sessionmanagerplugin -b /usr/local/bin/session-manager-plugin
+Linux (Ubuntu / Debian / AL2023 / RHEL)
+Ubuntu / Debian (Ubuntu 22.04+ / Debian):
+
+Bash
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+sudo dpkg -i session-manager-plugin.deb
+Fedora / RHEL / CentOS:
+
+Bash
+curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o "session-manager-plugin.rpm"
+sudo yum install -y session-manager-plugin.rpm
+Windows
+Using PowerShell as Administrator:
+
+PowerShell
+Invoke-WebRequest -Uri "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe" -OutFile "SessionManagerPluginSetup.exe"
+Start-Process -FilePath ".\SessionManagerPluginSetup.exe" -ArgumentList "/S" -Wait
+Step 2: Verify Installation
+Run the following command in a new terminal window to verify it's correctly mapped in your PATH:
+
+Bash
+session-manager-plugin
+(If successful, it will output: The Session Manager plugin was installed successfully.)
+
+Step 3: Re-run Your SSM Tunnel
+Once verified, run your SSM tunnel command again in Terminal 1:
+
+Bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target i-0f935f451f27d0a59 \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com"],"portNumber":["443"],"localPortNumber":["8443"]}'
+You should now see:
+
+Plaintext
+Starting session with SessionId: ...
+Port 8443 opened for sessionId ...
+Waiting for connections...
+aws eks update-kubeconfig --name prod-eks-karpenter && kubectl config set-cluster arn:aws:eks:us-east-1:$(aws sts get-caller-identity --query Account --output text):cluster/prod-eks-karpenter --server=https://localhost:8443
+
+Added new context arn:aws:eks:us-east-1:993568083058:cluster/prod-eks-karpenter to /home/taha/.kube/config
+
+Cluster "arn:aws:eks:us-east-1:993568083058:cluster/prod-eks-karpenter" set.
+
+taha@DESKTOP-CBB7HJU:~$ kubectl get pods
+
+E0831 23:10:59.845935   12582 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://localhost:8443/api?timeout=32s\": tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost"
+
+E0831 23:10:59.983885   12582 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://localhost:8443/api?timeout=32s\": tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost"
+
+E0831 23:11:00.127520   12582 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://localhost:8443/api?timeout=32s\": tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost"
+
+E0831 23:11:00.261429   12582 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://localhost:8443/api?timeout=32s\": tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost"
+
+E0831 23:11:00.393111   12582 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://localhost:8443/api?timeout=32s\": tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost"
+
+Unable to connect to the server: tls: failed to verify certificate: x509: certificate is valid for 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com, ip-172-16-174-152.ec2.internal, kubernetes, kubernetes.default, kubernetes.default.svc, kubernetes.default.svc.cluster.local, not localhost
+
+This TLS verification error happens because the EKS API server's x509 certificate is issued specifically to its AWS domain name (8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com), not localhost. When kubectl sends traffic to https://localhost:8443, the TLS handshake fails.
+
+Here are the two ways to fix this cleanly:
+
+Option 1: Point Domain Name to Localhost via /etc/hosts (Recommended)
+Instead of telling kubectl to talk to localhost, map the actual EKS domain name to 127.0.0.1 locally. This allows TLS verification to pass without bypassing security.
+
+Add an entry to your local /etc/hosts file:
+
+Bash
+echo "127.0.0.1 8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com" | sudo tee -a /etc/hosts
+Re-generate your standard kubeconfig:
+
+Bash
+aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
+Update the port to match your SSM tunnel (8443):
+
+Bash
+kubectl config set-cluster arn:aws:eks:us-east-1:993568083058:cluster/prod-eks-karpenter --server=https://8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com:8443
+Verify connection:
+
+Bash
+kubectl get nodes
+Option 2: Bypass TLS Verification for Localhost (Quick Testing)
+If you do not want to modify /etc/hosts, instruct kubectl to skip TLS verification for the local server endpoint:
+
+Bash
+kubectl config set-cluster arn:aws:eks:us-east-1:993568083058:cluster/prod-eks-karpenter --insecure-skip-tls-verify=true
+Now try running kubectl get nodes or continuing with your terraform apply step.
+
+kubectl get pods
+
+E0831 23:13:19.248008   13051 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/api?timeout=32s\": dial tcp 127.0.0.1:443: connect: connection refused"
+
+E0831 23:13:19.249730   13051 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/api?timeout=32s\": dial tcp 127.0.0.1:443: connect: connection refused"
+
+E0831 23:13:19.251403   13051 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/api?timeout=32s\": dial tcp 127.0.0.1:443: connect: connection refused"
+
+E0831 23:13:19.253412   13051 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/api?timeout=32s\": dial tcp 127.0.0.1:443: connect: connection refused"
+
+E0831 23:13:19.255030   13051 memcache.go:265] "Unhandled Error" err="couldn't get current server API group list: Get \"https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/api?timeout=32s\": dial tcp 127.0.0.1:443: connect: connection refused"
+
+The connection to the server 8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com was refused - did you specify the right host or port?
+
+The error shows kubectl is trying to connect to port 443 (127.0.0.1:443), but your SSM tunnel is listening on local port 8443.
+
+When you ran aws eks update-kubeconfig, AWS reset the cluster URL back to default port 443.
+
+The Fix
+Append port :8443 to the server URL in your kubeconfig:
+
+Bash
+kubectl config set-cluster arn:aws:eks:us-east-1:993568083058:cluster/prod-eks-karpenter \
+  --server=https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com:8443
+Verification
+Make sure your SSM tunnel is still active in Terminal 1, then test the connection:
+
+Bash
+kubectl get nodes
+Once that returns your node status successfully, you can proceed with terraform apply.
+
+Okay, it seems to have worked now.
+
+That is a huge win! Getting a fully private EKS cluster to talk through an SSM port-forwarding tunnel while maintaining strict TLS host verification can be tricky, but you’ve got a rock-solid Zero-Trust administrative path established now.
+
+Now that the tunnel is verified and kubectl is responding, your environment is ready for the remaining infrastructure lifecycle.
+
+Recommended Next Steps
+Complete Phase 2 Apply (Helm & Karpenter Resources)
+Run terraform apply to deploy the Karpenter helm release, node classes, and default node pools over the active tunnel.
+
+Verify Node Group & Karpenter Operations
+Check that your system node pool and Karpenter controller pod are up and running:
+
+Bash
+kubectl get pods -n karpenter
+kubectl get nodepools,nodeclasses
+Deploy a Test Workload (Optional Validation)
+Apply a simple deployment targeting the Karpenter-managed nodes to watch dynamic provisioners spin up Bottlerocket capacity on demand.
+
+Write me a readme for this project.
+
+Also, please document all the issues that we had in a separate log file. named track.log.
+
+                       +---------------------------------------------------+
+                       |                    AWS VPC                        |
+                       |                                                   |
+[ Local Developer ]       |  +--------------------+   +--------------------+  |
+|                 |  |   Public Subnet    |   |   Private Subnets  |  |
+| (SSM Tunnel)    |  |                    |   |                    |  |
++==================> [ SSM Bastion Host ]=> [ EKS API Endpoint] |  |
+|  Port 8443->443 |  +--------------------+   +--------------------+  |
+|                 |                                    |              |
+[ kubectl / Helm ] =====+                                    v              |
+|                          [ Core System Nodes ]    |
+|                          [ Karpenter Dynamic ]    |
++---------------------------------------------------+
+
+
+---
+
+## 📁 Repository Structure
+
+```text
+.
+├── environments/
+│   └── prod/
+│       ├── main.tf              # Root orchestrator for VPC, EKS, Bastion, & Karpenter
+│       ├── variables.tf         # Production input variables
+│       ├── outputs.tf           # Connection strings & SSM tunnel output commands
+│       └── providers.tf         # AWS, Helm, and Kubernetes provider definitions
+├── modules/
+│   ├── vpc/                     # Multi-AZ VPC module with NAT & IGW
+│   ├── eks_control_plane/       # EKS cluster, managed node groups, security groups
+│   ├── bastion/                 # Private/Public SSM Bastion host setup
+│   ├── karpenter_iam/           # IAM Roles and EKS Pod Identity Associations
+│   └── karpenter_resources/     # Helm release & Karpenter NodePool / NodeClass manifests
+├── README.md                    # Project documentation
+└── track.log                    # Technical issue log & troubleshooting history
+🚀 Deployment Guide
+Prerequisites
+AWS CLI v2 configured with appropriate administrator credentials.
+
+Terraform (>= 1.5.0).
+
+kubectl (v1.30+).
+
+AWS Session Manager Plugin installed locally:
+
+macOS: brew install --cask session-manager-plugin
+
+Linux: sudo dpkg -i session-manager-plugin.deb or sudo yum install session-manager-plugin.rpm
+
+Step 1: Deploy Core AWS Infrastructure (Phase 1)
+Provision network, cluster control plane, bastion host, and IAM roles without attempting K8s API connections:
+
+Bash
+cd environments/prod
+terraform init
+terraform apply -target=module.vpc -target=module.eks -target=module.karpenter_iam -target=module.bastion
+Step 2: Establish SSM Port-Forwarding Tunnel
+Obtain the Bastion Instance ID and EKS Endpoint from Terraform outputs.
+
+Map the EKS Endpoint domain locally in /etc/hosts to enable TLS verification over the tunnel:
+
+Bash
+# Add EKS endpoint host to local loopback
+echo "127.0.0.1 <YOUR-EKS-CLUSTER-ENDPOINT-HOST>" | sudo tee -a /etc/hosts
+Start the SSM tunnel in Terminal 1:
+
+Bash
+aws ssm start-session \
+  --region us-east-1 \
+  --target <BASTION_INSTANCE_ID> \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["<EKS_ENDPOINT_HOST>"],"portNumber":["443"],"localPortNumber":["8443"]}'
+Step 3: Configure Kubeconfig & Verify Access
+In Terminal 2, direct your local kubeconfig to route through the SSM local port (8443):
+
+Bash
+# Update kubeconfig
+aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
+
+# Re-point the cluster server endpoint to local port 8443
+kubectl config set-cluster arn:aws:eks:us-east-1:<ACCOUNT_ID>:cluster/prod-eks-karpenter \
+  --server=https://<EKS_ENDPOINT_HOST>:8443
+
+# Test connectivity
+kubectl get nodes
+Step 4: Complete Deployment (Phase 2)
+Deploy the remaining Kubernetes-native resources (Helm releases, Karpenter manifests) over the established tunnel:
+
+Bash
+terraform apply
+🛠️ Verification & Operations
+Check System Nodes:
+
+Bash
+kubectl get nodes -l workload.type=system
+Check Karpenter Controller Status:
+
+Bash
+kubectl get pods -n karpenter
+View Provisioners & NodeClasses:
+
+Bash
+kubectl get nodepools,nodeclasses
+📝 Troubleshooting & Issue History
+All infrastructure hurdles, API errors, network routing issues, and resolution strategies encountered during development are documented in detail inside track.log.
+"""
+
+track_log_content = """================================================================================
+TROUBLESHOOTING & DEVELOPMENT TRACK LOG
+Project: Zero-Trust EKS Cluster with Karpenter & SSM Bastion
+ISSUE #1: Unsupported Kubernetes Version & EKS Launch Behavior
+Symptoms / Question:
+Inquiry regarding whether launching EKS with an unsupported Kubernetes version
+causes cluster creation to get stuck in the CREATING state indefinitely.
+Root Cause:
+EKS cluster creation fails fast during API validation. Stuck CREATING states
+are almost always caused by VPC network issues (e.g., lack of available subnet
+IPs, missing route table entries, or missing service IAM roles).
+Resolution:
+Clarified AWS API validation behavior (returns immediate InvalidParameterException).
+
+ISSUE #2: EKS Managed Node Group Creation Failure (AMI Version Incompatibility)
+Error Log:
+"creating EKS Node Group (prod-eks-karpenter:system-addons-xxxx): operation error
+EKS: CreateNodegroup, StatusCode: 400, InvalidParameterException: Requested AMI for
+this version 1.30 is not supported"
+Root Cause:
+Kubernetes v1.30+ deprecated Amazon Linux 2 (AL2_x86_64) for EKS managed node
+groups. Unspecified ami_type defaulted to AL2_x86_64, which is rejected by AWS.
+Resolution:
+Explicitly configured ami_type = "AL2023_x86_64_STANDARD" in the system managed
+node group block and fixed the module parameter syntax from instance_type (singular)
+to instance_types (plural).
+
+ISSUE #3: Pod Identity Association Race Condition (404 ResourceNotFoundException)
+Error Log:
+"creating AWS EKS Pod Identity Association: operation error EKS: CreatePodIdentityAssociation,
+StatusCode: 404, ResourceNotFoundException: No cluster found for name: prod-eks-karpenter"
+Root Cause:
+Terraform attempted to provision aws_eks_pod_identity_association in parallel
+before the EKS cluster control plane creation completed due to missing explicit
+graph dependency.
+Resolution:
+Added explicit depends_on = [module.eks] inside the karpenter_iam module block and
+passed module.eks.cluster_name to establish implicit graph ordering.
+
+ISSUE #4: Private EKS Endpoint Network Timeout during Helm Apply
+Error Log:
+"Error: Kubernetes cluster unreachable: Get "https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/version":
+dial tcp 10.100.15.29:443: i/o timeout"
+Root Cause:
+helm_release.karpenter executed locally on the operator machine, which cannot
+directly access the private EKS cluster IP (10.100.15.29:443) when public API
+access is disabled.
+Resolution:
+Architected a 2-Phase Apply methodology:
+Phase 1: terraform apply -target=module.vpc -target=module.eks ...
+Phase 2: Establish SSM Session Manager tunnel to Bastion, then complete full terraform apply.
+
+ISSUE #5: SSM Start-Session JSON Escaping & Parameter Typo
+Error Log:
+"Error parsing parameter '--parameters': Invalid JSON: Expecting property name
+enclosed in double quotes"
+Root Cause:
+Over-escaped quotes (\") passed from shell string outputs and typo in key name
+(postNumber instead of portNumber).
+Resolution:
+Refactored Terraform output block to use jsonencode() wrapped in single quotes:
+value = "aws ssm start-session ... --parameters '${jsonencode({ host = [...], portNumber = ["443"], localPortNumber = ["8443"] })}'"
+
+ISSUE #6: SSM Bastion TargetNotConnected Error
+Error Log:
+"An error occurred (TargetNotConnected) when calling the StartSession operation:
+i-0c2d72e33d271e1b5 is not connected."
+Root Cause:
+Bastion host lacked an auto-assigned public IP address in the public subnet,
+preventing the local SSM agent from establishing outbound HTTPS (port 443) connection
+to AWS Systems Manager endpoints.
+Resolution:
+Set associate_public_ip_address = true in modules/bastion/main.tf and verified
+unbound egress (0.0.0.0/0) in the security group. Re-created bastion instance to acquire public IP.
+
+ISSUE #7: Missing AWS CLI SessionManagerPlugin Binary
+Error Log:
+"SessionManagerPlugin is not found. Please refer to SessionManager Documentation..."
+Root Cause:
+AWS CLI start-session command relies on an external plugin binary that was not installed.
+Resolution:
+Installed session-manager-plugin locally via OS package manager.
+
+ISSUE #8: Localhost TLS Certificate Verification Failure (x509 Mismatch)
+Error Log:
+"tls: failed to verify certificate: x509: certificate is valid for
+8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com ..., not localhost"
+Root Cause:
+Connecting directly to https://localhost:8443 breaks x509 SAN validation because
+the EKS API certificate is generated for the AWS EKS FQDN.
+Resolution:
+Added host entry in /etc/hosts pointing the cluster FQDN to 127.0.0.1, then
+updated kubeconfig endpoint to https://<EKS_FQDN>:8443.
+
+ISSUE #9: Kubeconfig Port Override Fallback (Connection Refused on 443)
+Error Log:
+"The connection to the server 8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com
+was refused - dial tcp 127.0.0.1:443: connect: connection refused"
+Root Cause:
+Running aws eks update-kubeconfig reset the cluster server URL back to standard
+port 443, bypassing local port 8443 where SSM tunnel was listening.
+Resolution:
+Executed kubectl config set-cluster ... --server=https://<EKS_FQDN>:8443 to ensure
+kubectl traffic targets the active SSM tunnel port.
+"""
+
+with open("README.md", "w") as f:
+f.write(readme_content.strip())
+
+with open("track.log", "w") as f:
+f.write(track_log_content.strip())
+
+print("Files generated successfully.")
+
+
+```text?code_stdout&code_event_index=1
+Files generated successfully.
+
+Your README.md and detailed track.log documentation files are ready.
+
+MD icon
+README
+ MD 
+LOG icon
+track
+ LOG 
+File Highlights
+README.md: Contains a full architectural breakdown, network diagram, repository structure, prerequisite list, two-phase deployment steps, and verification procedures.
+
+track.log: Documented all 9 technical issues resolved during the session, including:
+
+EKS v1.30+ AMI incompatibility (AL2023_x86_64_STANDARD).
+
+Pod Identity Association ordering dependencies (depends_on).
+
+Two-phase Terraform target deployment strategy for private control planes.
+
+SSM Bastion networking setup (associate_public_ip_address & egress rules).
+
+Local CLI parameter formatting using HCL jsonencode().
+
+AWS session-manager-plugin installation requirement.
+
+x509 TLS SAN validation fix using /etc/hosts and custom port override (:8443).
+
+
+
+
+Gemini is AI and can make mistakes, including about people. Your privacy and GeminiOpens in a new window
+
+Analysing
+================================================================================
+TROUBLESHOOTING & DEVELOPMENT TRACK LOG
+Project: Zero-Trust EKS Cluster with Karpenter & SSM Bastion
+================================================================================
+
+ISSUE #1: Unsupported Kubernetes Version & EKS Launch Behavior
+--------------------------------------------------------------------------------
+Symptoms / Question:
+  Inquiry regarding whether launching EKS with an unsupported Kubernetes version
+  causes cluster creation to get stuck in the `CREATING` state indefinitely.
+Root Cause:
+  EKS cluster creation fails fast during API validation. Stuck `CREATING` states
+  are almost always caused by VPC network issues (e.g., lack of available subnet
+  IPs, missing route table entries, or missing service IAM roles).
+Resolution:
+  Clarified AWS API validation behavior (returns immediate `InvalidParameterException`).
+
+--------------------------------------------------------------------------------
+ISSUE #2: EKS Managed Node Group Creation Failure (AMI Version Incompatibility)
+--------------------------------------------------------------------------------
+Error Log:
+  "creating EKS Node Group (prod-eks-karpenter:system-addons-xxxx): operation error
+  EKS: CreateNodegroup, StatusCode: 400, InvalidParameterException: Requested AMI for
+  this version 1.30 is not supported"
+Root Cause:
+  Kubernetes v1.30+ deprecated Amazon Linux 2 (`AL2_x86_64`) for EKS managed node
+  groups. Unspecified `ami_type` defaulted to `AL2_x86_64`, which is rejected by AWS.
+Resolution:
+  Explicitly configured `ami_type = "AL2023_x86_64_STANDARD"` in the system managed
+  node group block and fixed the module parameter syntax from `instance_type` (singular)
+  to `instance_types` (plural).
+
+--------------------------------------------------------------------------------
+ISSUE #3: Pod Identity Association Race Condition (404 ResourceNotFoundException)
+--------------------------------------------------------------------------------
+Error Log:
+  "creating AWS EKS Pod Identity Association: operation error EKS: CreatePodIdentityAssociation,
+  StatusCode: 404, ResourceNotFoundException: No cluster found for name: prod-eks-karpenter"
+Root Cause:
+  Terraform attempted to provision `aws_eks_pod_identity_association` in parallel
+  before the EKS cluster control plane creation completed due to missing explicit
+  graph dependency.
+Resolution:
+  Added explicit `depends_on = [module.eks]` inside the `karpenter_iam` module block and
+  passed `module.eks.cluster_name` to establish implicit graph ordering.
+
+--------------------------------------------------------------------------------
+ISSUE #4: Private EKS Endpoint Network Timeout during Helm Apply
+--------------------------------------------------------------------------------
+Error Log:
+  "Error: Kubernetes cluster unreachable: Get "https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/version":
+  dial tcp 10.100.15.29:443: i/o timeout"
+Root Cause:
+  `helm_release.karpenter` executed locally on the operator machine, which cannot
+  directly access the private EKS cluster IP (`10.100.15.29:443`) when public API
+  access is disabled.
+Resolution:
+  Architected a 2-Phase Apply methodology:
+    Phase 1: `terraform apply -target=module.vpc -target=module.eks ...`
+    Phase 2: Establish SSM Session Manager tunnel to Bastion, then complete full `terraform apply`.
+
+--------------------------------------------------------------------------------
+ISSUE #5: SSM Start-Session JSON Escaping & Parameter Typo
+--------------------------------------------------------------------------------
+Error Log:
+  "Error parsing parameter '--parameters': Invalid JSON: Expecting property name
+  enclosed in double quotes"
+Root Cause:
+  Over-escaped quotes (`"`) passed from shell string outputs and typo in key name
+  (`postNumber` instead of `portNumber`).
+Resolution:
+  Refactored Terraform output block to use `jsonencode()` wrapped in single quotes:
+  value = "aws ssm start-session ... --parameters '${jsonencode({ host = [...], portNumber = ["443"], localPortNumber = ["8443"] })}'"
+
+--------------------------------------------------------------------------------
+ISSUE #6: SSM Bastion TargetNotConnected Error
+--------------------------------------------------------------------------------
+Error Log:
+  "An error occurred (TargetNotConnected) when calling the StartSession operation:
+  i-0c2d72e33d271e1b5 is not connected."
+Root Cause:
+  Bastion host lacked an auto-assigned public IP address in the public subnet,
+  preventing the local SSM agent from establishing outbound HTTPS (port 443) connection
+  to AWS Systems Manager endpoints.
+Resolution:
+  Set `associate_public_ip_address = true` in `modules/bastion/main.tf` and verified
+  unbound egress (`0.0.0.0/0`) in the security group. Re-created bastion instance to acquire public IP.
+
+--------------------------------------------------------------------------------
+ISSUE #7: Missing AWS CLI SessionManagerPlugin Binary
+--------------------------------------------------------------------------------
+Error Log:
+  "SessionManagerPlugin is not found. Please refer to SessionManager Documentation..."
+Root Cause:
+  AWS CLI `start-session` command relies on an external plugin binary that was not installed.
+Resolution:
+  Installed `session-manager-plugin` locally via OS package manager.
+
+--------------------------------------------------------------------------------
+ISSUE #8: Localhost TLS Certificate Verification Failure (x509 Mismatch)
+--------------------------------------------------------------------------------
+Error Log:
+  "tls: failed to verify certificate: x509: certificate is valid for
+  8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com ..., not localhost"
+Root Cause:
+  Connecting directly to `https://localhost:8443` breaks x509 SAN validation because
+  the EKS API certificate is generated for the AWS EKS FQDN.
+Resolution:
+  Added host entry in `/etc/hosts` pointing the cluster FQDN to `127.0.0.1`, then
+  updated kubeconfig endpoint to `https://<EKS_FQDN>:8443`.
+
+--------------------------------------------------------------------------------
+ISSUE #9: Kubeconfig Port Override Fallback (Connection Refused on 443)
+--------------------------------------------------------------------------------
+Error Log:
+  "The connection to the server 8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com
+  was refused - dial tcp 127.0.0.1:443: connect: connection refused"
+Root Cause:
+  Running `aws eks update-kubeconfig` reset the cluster server URL back to standard
+  port 443, bypassing local port 8443 where SSM tunnel was listening.
+Resolution:
+  Executed `kubectl config set-cluster ... --server=https://<EKS_FQDN>:8443` to ensure
+  `kubectl` traffic targets the active SSM tunnel port.
+================================================================================
