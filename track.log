@@ -3204,144 +3204,127 @@ x509 TLS SAN validation fix using /etc/hosts and custom port override (:8443).
 Gemini is AI and can make mistakes, including about people. Your privacy and GeminiOpens in a new window
 
 Analysing
-# Zero-Trust Amazon EKS Cluster with Karpenter & SSM Bastion
+================================================================================
+TROUBLESHOOTING & DEVELOPMENT TRACK LOG
+Project: Zero-Trust EKS Cluster with Karpenter & SSM Bastion
+================================================================================
 
-A production-grade, modular Terraform project for deploying a Zero-Trust Amazon EKS cluster in private subnets with public API access disabled. Dynamic node autoscaling is managed by Karpenter, and administrative access is secured via AWS Systems Manager (SSM) Session Manager port-forwarding without exposing any SSH keys or public endpoints.
+ISSUE #1: Unsupported Kubernetes Version & EKS Launch Behavior
+--------------------------------------------------------------------------------
+Symptoms / Question:
+  Inquiry regarding whether launching EKS with an unsupported Kubernetes version
+  causes cluster creation to get stuck in the `CREATING` state indefinitely.
+Root Cause:
+  EKS cluster creation fails fast during API validation. Stuck `CREATING` states
+  are almost always caused by VPC network issues (e.g., lack of available subnet
+  IPs, missing route table entries, or missing service IAM roles).
+Resolution:
+  Clarified AWS API validation behavior (returns immediate `InvalidParameterException`).
 
----
+--------------------------------------------------------------------------------
+ISSUE #2: EKS Managed Node Group Creation Failure (AMI Version Incompatibility)
+--------------------------------------------------------------------------------
+Error Log:
+  "creating EKS Node Group (prod-eks-karpenter:system-addons-xxxx): operation error
+  EKS: CreateNodegroup, StatusCode: 400, InvalidParameterException: Requested AMI for
+  this version 1.30 is not supported"
+Root Cause:
+  Kubernetes v1.30+ deprecated Amazon Linux 2 (`AL2_x86_64`) for EKS managed node
+  groups. Unspecified `ami_type` defaulted to `AL2_x86_64`, which is rejected by AWS.
+Resolution:
+  Explicitly configured `ami_type = "AL2023_x86_64_STANDARD"` in the system managed
+  node group block and fixed the module parameter syntax from `instance_type` (singular)
+  to `instance_types` (plural).
 
-## 🏗️ Architecture Overview
+--------------------------------------------------------------------------------
+ISSUE #3: Pod Identity Association Race Condition (404 ResourceNotFoundException)
+--------------------------------------------------------------------------------
+Error Log:
+  "creating AWS EKS Pod Identity Association: operation error EKS: CreatePodIdentityAssociation,
+  StatusCode: 404, ResourceNotFoundException: No cluster found for name: prod-eks-karpenter"
+Root Cause:
+  Terraform attempted to provision `aws_eks_pod_identity_association` in parallel
+  before the EKS cluster control plane creation completed due to missing explicit
+  graph dependency.
+Resolution:
+  Added explicit `depends_on = [module.eks]` inside the `karpenter_iam` module block and
+  passed `module.eks.cluster_name` to establish implicit graph ordering.
 
-- **Network Isolation:** EKS Control Plane and worker nodes run strictly within private subnets across multiple Availability Zones. Public API server endpoint access is disabled.
-- **Zero-Trust Administrative Tunnel:** Bastion host provisioned in a public subnet with no inbound SSH ports open (`port 22` disabled). Access is granted via AWS Systems Manager (SSM) Session Manager port-forwarding over HTTPS (`port 443`).
-- **Core System Node Group:** AWS EKS Managed Node Group running **Amazon Linux 2023 (`AL2023_x86_64_STANDARD`)** with node taints (`CriticalAddonsOnly=true:NoSchedule`) for core cluster add-ons.
-- **Stateless Dynamic Autoscaling:** **Karpenter** deployed via Helm, leveraging **Bottlerocket OS** nodes via AWS Pod Identity for zero-latency, just-in-time workload provisioners.
-- **IAM Security:** Fine-grained IAM permissions powered by **AWS EKS Pod Identity Associations**.
+--------------------------------------------------------------------------------
+ISSUE #4: Private EKS Endpoint Network Timeout during Helm Apply
+--------------------------------------------------------------------------------
+Error Log:
+  "Error: Kubernetes cluster unreachable: Get "https://8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com/version":
+  dial tcp 10.100.15.29:443: i/o timeout"
+Root Cause:
+  `helm_release.karpenter` executed locally on the operator machine, which cannot
+  directly access the private EKS cluster IP (`10.100.15.29:443`) when public API
+  access is disabled.
+Resolution:
+  Architected a 2-Phase Apply methodology:
+    Phase 1: `terraform apply -target=module.vpc -target=module.eks ...`
+    Phase 2: Establish SSM Session Manager tunnel to Bastion, then complete full `terraform apply`.
 
-```
-                           +---------------------------------------------------+
-                           |                    AWS VPC                        |
-                           |                                                   |
- [ Local Developer ]       |  +--------------------+   +--------------------+  |
-         |                 |  |   Public Subnet    |   |   Private Subnets  |  |
-         | (SSM Tunnel)    |  |                    |   |                    |  |
-         +====================> [ SSM Bastion Host ]===> [ EKS API Endpoint] |  |
-         |  Port 8443->443 |  +--------------------+   +--------------------+  |
-         |                 |                                    |              |
-   [ kubectl / Helm ] =====+                                    v              |
-                           |                          [ Core System Nodes ]    |
-                           |                          [ Karpenter Dynamic ]    |
-                           +---------------------------------------------------+
-```
+--------------------------------------------------------------------------------
+ISSUE #5: SSM Start-Session JSON Escaping & Parameter Typo
+--------------------------------------------------------------------------------
+Error Log:
+  "Error parsing parameter '--parameters': Invalid JSON: Expecting property name
+  enclosed in double quotes"
+Root Cause:
+  Over-escaped quotes (`"`) passed from shell string outputs and typo in key name
+  (`postNumber` instead of `portNumber`).
+Resolution:
+  Refactored Terraform output block to use `jsonencode()` wrapped in single quotes:
+  value = "aws ssm start-session ... --parameters '${jsonencode({ host = [...], portNumber = ["443"], localPortNumber = ["8443"] })}'"
 
----
+--------------------------------------------------------------------------------
+ISSUE #6: SSM Bastion TargetNotConnected Error
+--------------------------------------------------------------------------------
+Error Log:
+  "An error occurred (TargetNotConnected) when calling the StartSession operation:
+  i-0c2d72e33d271e1b5 is not connected."
+Root Cause:
+  Bastion host lacked an auto-assigned public IP address in the public subnet,
+  preventing the local SSM agent from establishing outbound HTTPS (port 443) connection
+  to AWS Systems Manager endpoints.
+Resolution:
+  Set `associate_public_ip_address = true` in `modules/bastion/main.tf` and verified
+  unbound egress (`0.0.0.0/0`) in the security group. Re-created bastion instance to acquire public IP.
 
-## 📁 Repository Structure
+--------------------------------------------------------------------------------
+ISSUE #7: Missing AWS CLI SessionManagerPlugin Binary
+--------------------------------------------------------------------------------
+Error Log:
+  "SessionManagerPlugin is not found. Please refer to SessionManager Documentation..."
+Root Cause:
+  AWS CLI `start-session` command relies on an external plugin binary that was not installed.
+Resolution:
+  Installed `session-manager-plugin` locally via OS package manager.
 
-```text
-.
-├── environments/
-│   └── prod/
-│       ├── main.tf              # Root orchestrator for VPC, EKS, Bastion, & Karpenter
-│       ├── variables.tf         # Production input variables
-│       ├── outputs.tf           # Connection strings & SSM tunnel output commands
-│       └── providers.tf         # AWS, Helm, and Kubernetes provider definitions
-├── modules/
-│   ├── vpc/                     # Multi-AZ VPC module with NAT & IGW
-│   ├── eks_control_plane/       # EKS cluster, managed node groups, security groups
-│   ├── bastion/                 # Private/Public SSM Bastion host setup
-│   ├── karpenter_iam/           # IAM Roles and EKS Pod Identity Associations
-│   └── karpenter_resources/     # Helm release & Karpenter NodePool / NodeClass manifests
-├── README.md                    # Project documentation
-└── track.log                    # Technical issue log & troubleshooting history
-```
+--------------------------------------------------------------------------------
+ISSUE #8: Localhost TLS Certificate Verification Failure (x509 Mismatch)
+--------------------------------------------------------------------------------
+Error Log:
+  "tls: failed to verify certificate: x509: certificate is valid for
+  8e4c52f285a141f2b42d1175fe7c6ba1.gr7.us-east-1.eks.amazonaws.com ..., not localhost"
+Root Cause:
+  Connecting directly to `https://localhost:8443` breaks x509 SAN validation because
+  the EKS API certificate is generated for the AWS EKS FQDN.
+Resolution:
+  Added host entry in `/etc/hosts` pointing the cluster FQDN to `127.0.0.1`, then
+  updated kubeconfig endpoint to `https://<EKS_FQDN>:8443`.
 
----
-
-## 🚀 Deployment Guide
-
-### Prerequisites
-
-1. **AWS CLI v2** configured with appropriate administrator credentials.
-2. **Terraform** (>= 1.5.0).
-3. **kubectl** (v1.30+).
-4. **AWS Session Manager Plugin** installed locally:
-   - **macOS:** `brew install --cask session-manager-plugin`
-   - **Linux:** `sudo dpkg -i session-manager-plugin.deb` or `sudo yum install session-manager-plugin.rpm`
-
----
-
-### Step 1: Deploy Core AWS Infrastructure (Phase 1)
-
-Provision network, cluster control plane, bastion host, and IAM roles without attempting K8s API connections:
-
-```bash
-cd environments/prod
-terraform init
-terraform apply -target=module.vpc -target=module.eks -target=module.karpenter_iam -target=module.bastion
-```
-
----
-
-### Step 2: Establish SSM Port-Forwarding Tunnel
-
-1. Obtain the Bastion Instance ID and EKS Endpoint from Terraform outputs.
-2. Map the EKS Endpoint domain locally in `/etc/hosts` to enable TLS verification over the tunnel:
-   ```bash
-   # Add EKS endpoint host to local loopback
-   echo "127.0.0.1 <YOUR-EKS-CLUSTER-ENDPOINT-HOST>" | sudo tee -a /etc/hosts
-   ```
-3. Start the SSM tunnel in **Terminal 1**:
-   ```bash
-   aws ssm start-session      --region us-east-1      --target <BASTION_INSTANCE_ID>      --document-name AWS-StartPortForwardingSessionToRemoteHost      --parameters '{"host":["<EKS_ENDPOINT_HOST>"],"portNumber":["443"],"localPortNumber":["8443"]}'
-   ```
-
----
-
-### Step 3: Configure Kubeconfig & Verify Access
-
-In **Terminal 2**, direct your local `kubeconfig` to route through the SSM local port (`8443`):
-
-```bash
-# Update kubeconfig
-aws eks update-kubeconfig --region us-east-1 --name prod-eks-karpenter
-
-# Re-point the cluster server endpoint to local port 8443
-kubectl config set-cluster arn:aws:eks:us-east-1:<ACCOUNT_ID>:cluster/prod-eks-karpenter   --server=https://<EKS_ENDPOINT_HOST>:8443
-
-# Test connectivity
-kubectl get nodes
-```
-
----
-
-### Step 4: Complete Deployment (Phase 2)
-
-Deploy the remaining Kubernetes-native resources (Helm releases, Karpenter manifests) over the established tunnel:
-
-```bash
-terraform apply
-```
-
----
-
-## 🛠️ Verification & Operations
-
-- **Check System Nodes:**
-  ```bash
-  kubectl get nodes -l workload.type=system
-  ```
-- **Check Karpenter Controller Status:**
-  ```bash
-  kubectl get pods -n karpenter
-  ```
-- **View Provisioners & NodeClasses:**
-  ```bash
-  kubectl get nodepools,nodeclasses
-  ```
-
----
-
-## 📝 Troubleshooting & Issue History
-
-All infrastructure hurdles, API errors, network routing issues, and resolution strategies encountered during development are documented in detail inside [`track.log`](./track.log).
+--------------------------------------------------------------------------------
+ISSUE #9: Kubeconfig Port Override Fallback (Connection Refused on 443)
+--------------------------------------------------------------------------------
+Error Log:
+  "The connection to the server 8E4C52F285A141F2B42D1175FE7C6BA1.gr7.us-east-1.eks.amazonaws.com
+  was refused - dial tcp 127.0.0.1:443: connect: connection refused"
+Root Cause:
+  Running `aws eks update-kubeconfig` reset the cluster server URL back to standard
+  port 443, bypassing local port 8443 where SSM tunnel was listening.
+Resolution:
+  Executed `kubectl config set-cluster ... --server=https://<EKS_FQDN>:8443` to ensure
+  `kubectl` traffic targets the active SSM tunnel port.
+================================================================================

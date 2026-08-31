@@ -18,4 +18,17 @@ spec:
         - key: karpenter.sh/capacity-type
           operator: In
           values: ["spot", "on-demand"]
-        - key: karpenter
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["t", "m", "c"]
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+    consolidateAfter: 30s
+    budgets:
+      - nodes: "10%"
+  limits:
+    cpu: "${cpu_limit}"
+    memory: "${memory_limit}"

@@ -22,8 +22,8 @@ YAML
   ]
 }
 
-resource "kubelet_manifest" "ec2_node_class" {
-  yaml_body = templatefile("{path.module}/manifests/ec2nodeclass.yaml", {
+resource "kubectl_manifest" "ec2_node_class" {
+  yaml_body = templatefile("${path.module}/manifests/ec2nodeclass.yaml", {
     cluster_name   = var.cluster_name
     node_role_name = var.node_role_name
   })
@@ -32,11 +32,11 @@ resource "kubelet_manifest" "ec2_node_class" {
 
 }
 
-resource "kubelet_manifest" "node_pool" {
-  yaml_body = templatefile("${path.module}/manifests/nodepool-stateless.yaml", {
+resource "kubectl_manifest" "node_pool" {
+  yaml_body = templatefile("${path.module}/manifests/nodepool_stateless.yaml", {
     cpu_limit    = var.cpu_limit
     memory_limit = var.memory_limit
   })
 
-  depends_on = [kubelet_manifest.ec2_node_class]
+  depends_on = [kubectl_manifest.ec2_node_class]
 }
