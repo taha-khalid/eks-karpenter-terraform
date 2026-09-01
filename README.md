@@ -1,17 +1,21 @@
-Zero-Trust Amazon EKS with Karpenter
+# Zero-Trust Amazon EKS with Karpenter
 
-A production-oriented Terraform project for deploying a private Amazon EKS cluster with secure administrative access through AWS Systems Manager (SSM) and just-in-time worker-node provisioning through Karpenter.
+A production-oriented Terraform reference implementation for deploying a private Amazon EKS cluster with secure, auditable administrative access through AWS Systems Manager (SSM) and just-in-time worker capacity through Karpenter.
 
-The project uses reusable Terraform modules and separate environment roots for dev, staging, and prod.
+The repository is organized around reusable Terraform modules and isolated environment roots for development, staging, and production.
 
-Architecture
+> [!IMPORTANT]
+> This repository is a reference implementation. Review IAM policies, network boundaries, quotas, supported versions, and organizational controls before deploying it in a production AWS account.
 
+## Architecture
+
+```mermaid
 flowchart TD
     Developer["Developer workstation<br/>kubectl · Helm · Terraform"]
     Tunnel["SSM port-forwarding tunnel<br/>localhost:8443 → EKS:443"]
 
     subgraph VPC["AWS VPC"]
-        Bastion["SSM bastion<br/>No inbound SSH"]
+        Bastion["SSM administration instance<br/>No inbound access"]
         API["Private EKS API endpoint"]
         System["Managed system node group<br/>Amazon Linux 2023"]
         Karpenter["Karpenter controller"]
@@ -22,27 +26,30 @@ flowchart TD
     API --> System
     System --> Karpenter
     Karpenter --> Dynamic
+```
 
-Key design choices
+### Request and provisioning flow
 
-Private EKS API: Public Kubernetes API access is disabled.
+1. An operator establishes an authenticated SSM port-forwarding session through the administration instance.
+2. `kubectl`, Helm, and the Kubernetes Terraform provider reach the private EKS API through the local tunnel.
+3. A fixed managed node group hosts critical system workloads and the Karpenter controller.
+4. Karpenter evaluates unschedulable pods and launches right-sized Bottlerocket nodes using Spot or On-Demand capacity.
+5. EventBridge and SQS deliver interruption and lifecycle events so Karpenter can drain and replace affected capacity.
 
-SSM-only administration: The bastion exposes no inbound SSH port and requires no SSH keys.
+## Design principles
 
-Dedicated system capacity: Core add-ons and the Karpenter controller run on a fixed EKS managed node group.
+- **Private control plane:** Public access to the Kubernetes API is disabled.
+- **SSM-only administration:** The administration instance has no inbound security-group rules and requires no SSH keys.
+- **Stable system capacity:** Critical add-ons and the Karpenter controller run on a dedicated EKS managed node group.
+- **Elastic workload capacity:** Karpenter provisions instances according to pending pod requirements and scheduling constraints.
+- **Hardened worker nodes:** Dynamic nodes use Bottlerocket, encrypted EBS volumes, and IMDSv2 with a hop limit of `1`.
+- **Workload-scoped AWS identity:** Karpenter uses EKS Pod Identity; long-lived AWS credentials are not stored in the cluster.
+- **Interruption awareness:** EventBridge and SQS provide Spot interruption and instance lifecycle notifications.
+- **Environment isolation:** Development, staging, and production share modules while maintaining independent configuration and state.
 
-Dynamic workload capacity: Karpenter launches appropriately sized Spot or On-Demand instances based on pending pod requirements.
+## Repository layout
 
-Hardened nodes: Dynamically provisioned nodes use Bottlerocket, encrypted EBS volumes, and IMDSv2.
-
-Pod-level AWS identity: Karpenter uses EKS Pod Identity instead of credentials stored in the cluster.
-
-Interruption handling: EventBridge and SQS notify Karpenter about Spot interruption and instance lifecycle events.
-
-Multi-environment layout: Development, staging, and production use the same modules with separate state and configuration.
-
-Repository structure
-
+```text
 .
 ├── environments/
 │   ├── dev/
@@ -66,271 +73,242 @@ Repository structure
 │   └── vpc/
 ├── README.md
 └── track.log
+```
 
-Components
+## Components
 
-Component
+| Component | Responsibility |
+| --- | --- |
+| VPC | Multi-AZ networking, private subnets, routing, and controlled outbound connectivity |
+| EKS control plane | Private Kubernetes API, KMS encryption, managed add-ons, and system node capacity |
+| SSM administration instance | Authenticated path to the private EKS endpoint without inbound network access |
+| Karpenter IAM | Controller identity, worker-node role, interruption queue, and event rules |
+| Karpenter resources | Helm release, `EC2NodeClass`, and workload-specific `NodePool` resources |
 
-Purpose
+## Prerequisites
 
-VPC
+- An AWS account and credentials authorized to manage VPC, EKS, EC2, IAM, KMS, EventBridge, and SQS resources
+- Terraform `>= 1.5`
+- AWS CLI v2
+- `kubectl`
+- AWS Session Manager plugin
 
-Multi-AZ networking, private worker subnets, public bastion subnet, routing, and NAT connectivity
+Confirm the local toolchain and active AWS identity:
 
-EKS control plane
-
-Private Kubernetes API, cluster encryption, add-ons, and managed system nodes
-
-SSM bastion
-
-Administrative path to the private EKS endpoint without inbound access
-
-Karpenter IAM
-
-Controller identity, node role, interruption queue, and event rules
-
-Karpenter resources
-
-Helm deployment, EC2NodeClass, and workload-specific NodePool resources
-
-Prerequisites
-
-An AWS account and credentials with permission to create VPC, EKS, EC2, IAM, KMS, EventBridge, and SQS resources
-
-Terraform >= 1.5
-
-AWS CLI v2
-
-kubectl
-
-AWS Session Manager plugin
-
-Confirm the local tooling before deployment:
-
+```bash
 terraform version
 aws --version
 kubectl version --client
 session-manager-plugin --version
 aws sts get-caller-identity
+```
 
-Configuration
+## Configuration
 
-Select an environment and review its terraform.tfvars before applying:
+Select an environment and review its `terraform.tfvars` before deployment:
 
+```hcl
 aws_region   = "us-east-1"
 environment  = "prod"
 cluster_name = "prod-eks-karpenter"
 vpc_cidr     = "10.100.0.0/16"
+```
 
-Do not commit secrets, credentials, account-specific identifiers, or sensitive backend configuration to the repository.
+Never commit credentials, secrets, account-specific identifiers, generated plans, or sensitive backend configuration.
 
-Deployment
+## Deployment
 
-Because the EKS API is private, deployment is completed in two phases. The first phase creates AWS infrastructure. The second runs Kubernetes and Helm operations through the SSM tunnel.
+Because the EKS API is private, deployment uses two phases:
 
-The examples below use production. Replace prod with dev or staging as required.
+1. Provision the AWS foundation required to reach the cluster.
+2. Establish the SSM tunnel, then converge resources that use Kubernetes and Helm providers.
 
-1. Initialize and review
+The examples below target `prod`. Replace it with `dev` or `staging` as appropriate.
 
+### 1. Initialize and review
+
+```bash
 cd environments/prod
 terraform init
 terraform fmt -check -recursive ../..
 terraform validate
 terraform plan -out=tfplan
+```
 
-2. Deploy the AWS-side foundation
+### 2. Bootstrap the AWS foundation
 
+```bash
 terraform apply \
   -target=module.vpc \
   -target=module.eks \
   -target=module.karpenter_iam \
   -target=module.bastion
+```
 
-Targeted applies are used here only to bootstrap access to the private cluster. Always follow this step with a normal terraform plan and terraform apply so the final state converges completely.
+> [!NOTE]
+> Targeted apply is used only to bootstrap connectivity to the private cluster. Always follow it with an un-targeted `terraform plan` and `terraform apply` so the configuration fully converges.
 
-3. Establish the SSM tunnel
+### 3. Establish the SSM tunnel
 
-Get the bastion instance ID and EKS endpoint from the environment outputs:
+Inspect the outputs to obtain the administration instance ID and EKS endpoint:
 
+```bash
 terraform output
+```
 
-Map the EKS endpoint hostname to the local loopback interface. This keeps TLS hostname validation intact while traffic is forwarded through SSM:
+Map the EKS endpoint hostname to the loopback interface. Retaining the original hostname preserves TLS certificate validation:
 
+```bash
 echo "127.0.0.1 <EKS_ENDPOINT_HOST>" | sudo tee -a /etc/hosts
+```
 
-Start the tunnel in a separate terminal and leave it running:
+Start the tunnel in a separate terminal and keep the session active:
 
+```bash
 aws ssm start-session \
   --region <AWS_REGION> \
   --target <BASTION_INSTANCE_ID> \
   --document-name AWS-StartPortForwardingSessionToRemoteHost \
   --parameters '{"host":["<EKS_ENDPOINT_HOST>"],"portNumber":["443"],"localPortNumber":["8443"]}'
+```
 
-4. Configure Kubernetes access
+### 4. Configure Kubernetes access
 
-In another terminal, create the kubeconfig entry:
+In another terminal, create or update the kubeconfig entry:
 
+```bash
 aws eks update-kubeconfig \
   --region <AWS_REGION> \
   --name <CLUSTER_NAME> \
   --alias <CLUSTER_NAME>
+```
 
-Point that kubeconfig cluster entry to the local tunnel:
+Route that entry through the local tunnel:
 
+```bash
 kubectl config set-cluster <CLUSTER_NAME> \
   --server=https://<EKS_ENDPOINT_HOST>:8443
+```
 
-Verify access:
+Verify connectivity:
 
+```bash
 kubectl cluster-info
-kubectl get nodes
+kubectl get nodes -o wide
+```
 
-Running aws eks update-kubeconfig again resets the server URL to port 443. Reapply the kubectl config set-cluster command while using the tunnel.
+> [!TIP]
+> Running `aws eks update-kubeconfig` again restores the server URL to port `443`. Reapply `kubectl config set-cluster` while the SSM tunnel is in use.
 
-5. Complete the deployment
+### 5. Converge the full configuration
 
-With the SSM tunnel still active:
+With the SSM tunnel active:
 
+```bash
 terraform plan -out=tfplan
 terraform apply tfplan
+```
 
-This installs Karpenter and applies the EC2NodeClass and NodePool resources.
+This installs Karpenter and applies the configured `EC2NodeClass` and `NodePool` resources.
 
-Verification
+## Verification
 
-Check the fixed system capacity:
+### System capacity
 
+```bash
 kubectl get nodes -l workload.type=system -o wide
+```
 
-Check the Karpenter controller and custom resources:
+### Karpenter health and resources
 
+```bash
 kubectl get pods -n karpenter
 kubectl get nodepools
 kubectl get ec2nodeclasses
 kubectl get nodeclaims
+```
 
-Follow controller activity while deploying a workload:
+### Provisioning activity
 
+Deploy a workload with explicit CPU and memory requests, then follow controller activity:
+
+```bash
 kubectl logs -n karpenter \
   -l app.kubernetes.io/name=karpenter \
   -c controller \
   --follow
+```
 
-Confirm that dynamically provisioned nodes satisfy the configured security requirements:
+Inspect the resulting nodes and capacity characteristics:
 
+```bash
 kubectl get nodes \
   -L karpenter.sh/capacity-type,kubernetes.io/arch,node.kubernetes.io/instance-type
+```
 
-Security controls
+## Security controls
 
-Private-only EKS control-plane endpoint
+| Control | Implementation |
+| --- | --- |
+| Control-plane exposure | Private-only EKS endpoint |
+| Administrative access | SSM Session Manager; no inbound rules or SSH keys |
+| Kubernetes secret encryption | Customer-managed AWS KMS key |
+| Worker storage | Encrypted EBS volumes |
+| Instance metadata | IMDSv2 required; hop limit set to `1` |
+| Dynamic node OS | Bottlerocket |
+| AWS identity | Separate controller and worker-node IAM roles; EKS Pod Identity for Karpenter |
+| Resource discovery | Cluster-specific subnet and security-group tags |
+| System workload isolation | Dedicated, tainted managed nodes |
+| Interruption response | EventBridge events delivered through SQS to Karpenter |
 
-No inbound rules or SSH keys on the SSM bastion
+## Operational and cost considerations
 
-Encrypted Kubernetes secrets using AWS KMS
+- Production deployments should span multiple Availability Zones. NAT gateway topology should balance failure-domain isolation against cost.
+- Spot capacity reduces compute cost but remains interruptible. Use disruption budgets, topology spread constraints, and multiple eligible instance families.
+- Define realistic pod requests and limits; Karpenter's provisioning decisions depend on accurate scheduling requirements.
+- Apply `PodDisruptionBudget` resources to highly available services, while ensuring they do not prevent safe consolidation or node replacement.
+- Pin and test Terraform, provider, EKS, add-on, and Karpenter versions as a compatible release set.
+- Promote reviewed changes between environments and inspect every production plan before approval.
+- Monitor SQS queue depth, Karpenter reconciliation errors, unschedulable pods, node churn, and Spot interruption rates.
 
-EBS encryption for dynamically created nodes
+## Troubleshooting
 
-IMDSv2 required with a hop limit of 1
+| Symptom | Likely cause | Resolution |
+| --- | --- | --- |
+| EKS API request times out | The private API is unreachable because the tunnel is inactive | Start the SSM port-forwarding session and retry |
+| `TargetNotConnected` | The administration instance is not registered with Systems Manager | Check the SSM agent, instance profile, DNS resolution, and outbound HTTPS connectivity |
+| `SessionManagerPlugin` is not found | The local Session Manager plugin is missing | Install the plugin and restart the shell |
+| TLS certificate is valid for the EKS hostname, not `localhost` | Kubeconfig points directly to `localhost` | Map the EKS hostname to `127.0.0.1` and retain that hostname in the server URL |
+| Connection refused on `127.0.0.1:443` | `update-kubeconfig` restored the default port | Set the kubeconfig server URL back to `https://<EKS_ENDPOINT_HOST>:8443` |
+| Pod Identity association reports that the cluster does not exist | Terraform dependency ordering is incomplete | Add an explicit dependency from the Karpenter IAM resources to the EKS module where data flow does not imply one |
+| Managed node-group AMI is rejected | The AMI type is incompatible with the selected EKS version | Select a supported type such as `AL2023_x86_64_STANDARD` and verify current EKS compatibility |
+| Pods remain pending and no `NodeClaim` appears | Pod constraints do not match the `NodePool`, or the controller lacks permissions | Inspect pod events, Karpenter logs, NodePool limits, taints, requirements, IAM, and EC2 quotas |
+| A `NodeClaim` is created but the node does not join | Bootstrap, networking, IAM, or security-group configuration is invalid | Inspect the `NodeClaim`, EC2 instance status, node role, cluster access, subnet routes, and security groups |
 
-Bottlerocket for a minimal, purpose-built worker-node operating system
+The complete implementation and troubleshooting history is available in [`track.log`](./track.log).
 
-IAM separation between the Karpenter controller and EC2 worker nodes
+## Destroying an environment
 
-Discovery restricted through cluster-specific subnet and security-group tags
+Keep the SSM tunnel active while Terraform removes resources managed through Kubernetes or Helm, then destroy the remaining AWS infrastructure:
 
-Dedicated, tainted system nodes for critical cluster services
-
-Operations and cost considerations
-
-Production uses multi-AZ networking and may create one NAT gateway per Availability Zone.
-
-Spot capacity lowers workload cost but can be interrupted; disruption budgets and interruption handling reduce application impact.
-
-Workloads should define realistic CPU and memory requests so Karpenter can make sound scheduling decisions.
-
-Use PodDisruptionBudgets and topology spread constraints for highly available services.
-
-Pin tested Terraform module, provider, EKS, and Karpenter versions before production deployment.
-
-Review terraform plan carefully when promoting changes between environments.
-
-Troubleshooting
-
-Symptom
-
-Likely cause
-
-Resolution
-
-EKS API request times out
-
-The API is private and the tunnel is not active
-
-Start the SSM port-forwarding session and retry
-
-TargetNotConnected
-
-The bastion cannot reach Systems Manager or its agent is not online
-
-Check SSM agent status, instance profile, DNS, and outbound HTTPS access
-
-SessionManagerPlugin is not found
-
-The local plugin is missing
-
-Install the Session Manager plugin and restart the shell
-
-TLS certificate is valid for the EKS hostname, not localhost
-
-Kubeconfig uses localhost directly
-
-Map the EKS hostname to 127.0.0.1 and retain the original hostname in the URL
-
-Connection refused on 127.0.0.1:443
-
-update-kubeconfig restored the default port
-
-Change the kubeconfig server URL back to https://<EKS_ENDPOINT_HOST>:8443
-
-Pod Identity association reports cluster not found
-
-Terraform dependency ordering is incomplete
-
-Make the Karpenter IAM module depend on the EKS module
-
-Managed node-group AMI is rejected
-
-The configured AMI type is incompatible with the EKS version
-
-Use a supported AMI such as AL2023_x86_64_STANDARD
-
-The complete development and troubleshooting history is recorded in track.log.
-
-Destroying an environment
-
-Keep the SSM tunnel active while Terraform removes Kubernetes-managed resources, then destroy the remaining AWS infrastructure:
-
+```bash
 cd environments/<environment>
 terraform plan -destroy -out=destroy.tfplan
 terraform apply destroy.tfplan
+```
 
-Review the plan before approval. Destruction permanently removes the selected environment and may leave externally managed resources or retained storage that require separate cleanup.
+> [!WARNING]
+> Review the destruction plan carefully. This operation permanently removes the selected environment. Retained volumes, snapshots, load balancers, or externally managed resources may require separate cleanup.
 
-Roadmap
+## Roadmap
 
-Velero backup and disaster recovery
+- [ ] Backup and disaster recovery with Velero
+- [ ] Runtime threat detection with Falco
+- [ ] Centralized metrics, logs, dashboards, and alerting
+- [ ] Admission policy enforcement with Kyverno or OPA Gatekeeper
+- [ ] Automated validation and deployment through CI/CD
+- [ ] Additional NodePools for stateful, compute-intensive, and ARM64 workloads
 
-Runtime threat detection with Falco
+## Disclaimer
 
-Centralized metrics, logs, and alerts
-
-Policy enforcement with Kyverno or OPA Gatekeeper
-
-Automated validation and deployment through CI/CD
-
-Additional NodePools for stateful, compute-intensive, and ARM64 workloads
-
-Disclaimer
-
-This project is intended as a production-oriented reference implementation. Review IAM permissions, network design, Kubernetes versions, Karpenter compatibility, quotas, and organizational security requirements before using it in a production account.
+This project is intended as a production-oriented reference architecture, not a turnkey production platform. Validate IAM permissions, network design, Kubernetes and Karpenter compatibility, service quotas, recovery procedures, observability, and organizational security requirements before adoption.
